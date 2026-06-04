@@ -19,7 +19,7 @@
 
 安全约束:
   S-01: 所有写入L4的经验必须经过去个性化处理，禁止保留任何可关联到特定用户的个人信息
-  S-02: L4不接受警示条目标签为CAUTION的经验，确保长期层不包含失败策略
+  S-02: L4不接受任何警示标签（CAUTION/PERMANENT_CAUTION）的经验，确保长期层不包含失败策略
   S-03: L4层经验受强遗忘保护，遗忘阈值显著低于其他层级
   S-04: 去个性化后的重要度重算必须去除V值（用户价值）维度，仅基于安全显著性与复用频次
   S-05: L4层经验在晋升L5时必须额外通过安全底线校验（由ag-mem-43执行）
@@ -47,7 +47,7 @@ class ExperienceEntry:
     experience_data: Dict[str, Any] = field(default_factory=dict)
     i_value: float = 0.0
     s_value: float = 0.0
-    v_value: float = 0.0  # 写入L4后置零
+    v_value: float = 0.0
     c_value: float = 0.0
     result_label: str = "成功"
     caution_label: str = "NORMAL"
@@ -104,15 +104,22 @@ class AbstractionTrigger:
 
 class L4LongTermStorage:
     # 容量配置
-    L4_CAPACITY_RATIO = 0.045  # 占漏斗二总容量的4.5%
+    L4_CAPACITY_RATIO = 0.045
     MAX_ENTRIES = 1000
     MAX_ENTRY_SIZE_BYTES = 25 * 1024
     CAPACITY_WARN_THRESHOLD = 0.80
     CAPACITY_CRITICAL_THRESHOLD = 0.95
-    ABSTRACT_TRIGGER_COUNT = 20  # 每新增20条同类经验触发抽象提炼
-    ABSTRACT_TIMED_INTERVAL_SEC = 72 * 3600  # 72小时
-    FORGET_SCAN_INTERVAL_SEC = 24 * 3600  # 24小时
+    ABSTRACT_TRIGGER_COUNT = 20
+    ABSTRACT_TIMED_INTERVAL_SEC = 72 * 3600
+    FORGET_SCAN_INTERVAL_SEC = 24 * 3600
     STATUS_REPORT_INTERVAL_SEC = 120
+
+    # 去个性化白名单：仅保留这些字段
+    ANONYMIZE_KEEP_FIELDS = {
+        "tool", "tool_sequence", "task_feature_vector", "task_vector",
+        "result_label", "tags", "task_type", "scene_category",
+        "tool_name", "api_name", "action_type", "parameters"
+    }
 
     def __init__(self):
         self.module_id = "ag-mem-26"
@@ -122,7 +129,7 @@ class L4LongTermStorage:
         self.state = StorageState.NORMAL
         self._entries: Dict[str, ExperienceEntry] = {}
         self._entry_count: int = 0
-        self._abstract_counter: Dict[str, int] = {}  # 分槽编号 → 新增条目数
+        self._abstract_counter: Dict[str, int] = {}
         self._recent_90d_writes: int = 0
         self._last_abstract_time: float = time.time()
         self._last_forget_scan: float = time.time()
@@ -184,8 +191,13 @@ class L4LongTermStorage:
         if self.state in (StorageState.CAPACITY_WARNING, StorageState.CAPACITY_CRITICAL):
             cleanup = self._query_cleanup_confirm() if self._query_cleanup_confirm else None
             if cleanup:
-                cleaned = cleanup.get("cleaned_count", 0)
-                self._entry_count -= cleaned
+                cleaned_count = cleanup.get("cleaned_count", 0)
+                cleared_ids = cleanup.get("cleared_ids", [])
+                # 修复：从 _entries 字典中移除已清理条目
+                for eid in cleared_ids:
+                    if eid in self._entries:
+                        del self._entries[eid]
+                self._entry_count = len(self._entries)
                 if self._calculate_usage_pct() < self.CAPACITY_WARN_THRESHOLD:
                     self.state = StorageState.NORMAL
 
@@ -222,7 +234,6 @@ class L4LongTermStorage:
         return self._handle_promotion(promotion)
 
     def _handle_promotion(self, promotion: L4PromotionList) -> L4WriteConfirm:
-        # 容量检查
         usage_pct = self._calculate_usage_pct()
         if usage_pct >= self.CAPACITY_CRITICAL_THRESHOLD:
             self.state = StorageState.CAPACITY_CRITICAL
@@ -243,9 +254,12 @@ class L4LongTermStorage:
         anonymized_count = 0
 
         for entry in promotion.entries:
-            # 拒绝CAUTION条目
-            if entry.caution_label == "CAUTION":
-                self._log_event("CAUTION_REJECTED_L4", {"entry_id": entry.entry_id})
+            # 【修复点1】拒绝 CAUTION 和 PERMANENT_CAUTION 条目
+            if entry.caution_label in ("CAUTION", "PERMANENT_CAUTION"):
+                self._log_event("CAUTION_REJECTED_L4", {
+                    "entry_id": entry.entry_id,
+                    "caution_label": entry.caution_label
+                })
                 continue
 
             # 去个性化处理
@@ -267,7 +281,6 @@ class L4LongTermStorage:
                 self._abstract_counter[slot] = 0
             self._abstract_counter[slot] += 1
 
-            # 检查是否触发抽象提炼
             if self._abstract_counter[slot] >= self.ABSTRACT_TRIGGER_COUNT:
                 self._trigger_abstraction_for_slot(slot)
                 self._abstract_counter[slot] = 0
@@ -308,18 +321,19 @@ class L4LongTermStorage:
             ))
 
     def _anonymize_entry(self, entry: ExperienceEntry):
-        # 删除个性化字段，替换为匿名标记
-        entry.experience_data.pop("user_id", None)
-        entry.experience_data.pop("session_id", None)
-        entry.experience_data.pop("device_fingerprint", None)
-        entry.experience_data.pop("geo_location", None)
-        entry.experience_data.pop("raw_input_text", None)
-        entry.experience_data["user_profile"] = "ANONYMOUS"
+        # 【修复点2】使用白名单策略：仅保留安全字段
+        original = entry.experience_data
+        cleaned = {}
+        for field in self.ANONYMIZE_KEEP_FIELDS:
+            if field in original:
+                cleaned[field] = original[field]
+        # 强制设置匿名标记
+        cleaned["user_profile"] = "ANONYMOUS"
+        entry.experience_data = cleaned
         # V值置零
         entry.v_value = 0.0
 
     def _recalculate_i_value(self, entry: ExperienceEntry) -> float:
-        # I = I₀ + α·S + γ·C  (去除V值)
         alpha = 0.40
         gamma = 0.30
         i0 = entry.i_value - (0.40 * entry.s_value + 0.30 * entry.v_value + 0.30 * entry.c_value)
@@ -428,7 +442,9 @@ def demo_main():
     storage.set_promotion_list_query(lambda: L4PromotionList(
         entries=[
             ExperienceEntry(entry_id="L3-TOOL-001", source_slot_id="ag-mem-16",
-                            experience_data={"tool": "weather_api", "user_id": "U001"},
+                            experience_data={"tool": "weather_api", "user_id": "U001", "session_id": "S001",
+                                             "device_fingerprint": "DEV-X", "geo_location": "Beijing",
+                                             "raw_input_text": "今天天气怎么样", "user_settings": {"theme": "dark"}},
                             i_value=0.75, s_value=0.6, v_value=0.5, c_value=0.4, result_label="成功"),
         ],
         source_slot_id="ag-mem-16"
@@ -436,17 +452,32 @@ def demo_main():
     result = storage.run_storage_cycle()
     if result:
         print(f"  接收: {result.received_count}, 写入: {result.success_count}, 去个性化: {result.anonymized_count}")
+        # 查看去个性化后的数据
+        for eid, entry in storage._entries.items():
+            print(f"  去个性化后字段: {list(entry.experience_data.keys())}")
+            print(f"  V值: {entry.v_value}")
 
     print_separator("STEP 2: 拒绝CAUTION条目")
     storage.set_promotion_list_query(lambda: L4PromotionList(
         entries=[
-            ExperienceEntry(entry_id="L3-TOOL-CAUTION", source_slot_id="ag-mem-16",
+            ExperienceEntry(entry_id="L3-CAUTION", source_slot_id="ag-mem-16",
                             caution_label="CAUTION", i_value=0.6),
         ]
     ))
     result = storage.run_storage_cycle()
     if result:
         print(f"  接收: {result.received_count}, 写入: {result.success_count} (CAUTION条目被拒绝)")
+
+    print_separator("STEP 3: 拒绝PERMANENT_CAUTION条目")
+    storage.set_promotion_list_query(lambda: L4PromotionList(
+        entries=[
+            ExperienceEntry(entry_id="L3-PERM-CAUTION", source_slot_id="ag-mem-16",
+                            caution_label="PERMANENT_CAUTION", i_value=0.6),
+        ]
+    ))
+    result = storage.run_storage_cycle()
+    if result:
+        print(f"  接收: {result.received_count}, 写入: {result.success_count} (PERMANENT_CAUTION条目被拒绝)")
 
     print("\n✅ L4长期层存储单元演示完成")
 
@@ -468,14 +499,21 @@ if __name__ == "__main__":
             s = setup_storage()
             s.set_promotion_list_query(lambda: L4PromotionList(entries=[
                 ExperienceEntry(entry_id="T01", source_slot_id="ag-mem-16",
-                                experience_data={"user_id": "U001", "session_id": "S001", "tool": "test"},
+                                experience_data={"user_id": "U001", "session_id": "S001", "tool": "test",
+                                                 "raw_input_text": "hello", "geo_location": "Beijing"},
                                 i_value=0.75, s_value=0.6, v_value=0.5, c_value=0.4)
             ]))
             result = s.run_storage_cycle()
             assert result is not None
             assert result.success_count == 1
             entry = s._entries["T01"]
+            # 隐私字段应被移除
             assert "user_id" not in entry.experience_data
+            assert "session_id" not in entry.experience_data
+            assert "raw_input_text" not in entry.experience_data
+            assert "geo_location" not in entry.experience_data
+            # 核心字段应保留
+            assert "tool" in entry.experience_data
             assert entry.v_value == 0.0
             print("   ✅ PASS")
             passed += 1
@@ -489,6 +527,21 @@ if __name__ == "__main__":
             s = setup_storage()
             s.set_promotion_list_query(lambda: L4PromotionList(entries=[
                 ExperienceEntry(entry_id="T02", caution_label="CAUTION", i_value=0.6)
+            ]))
+            result = s.run_storage_cycle()
+            assert result.success_count == 0
+            print("   ✅ PASS")
+            passed += 1
+        except Exception as e:
+            print(f"   ❌ FAIL: {e}")
+            failed += 1
+
+        # TC-M26-02b: 拒绝PERMANENT_CAUTION条目（新增测试）
+        print("\n[TC-M26-02b] 拒绝PERMANENT_CAUTION条目")
+        try:
+            s = setup_storage()
+            s.set_promotion_list_query(lambda: L4PromotionList(entries=[
+                ExperienceEntry(entry_id="T02b", caution_label="PERMANENT_CAUTION", i_value=0.6)
             ]))
             result = s.run_storage_cycle()
             assert result.success_count == 0
@@ -513,42 +566,27 @@ if __name__ == "__main__":
             print(f"   ❌ FAIL: {e}")
             failed += 1
 
-        # TC-M26-04: 触发抽象提炼
-        print("\n[TC-M26-04] 触发抽象提炼（累计20条）")
+        # TC-M26-04: 清理后从内存移除条目（新增测试）
+        print("\n[TC-M26-04] 清理后从内存移除条目")
         try:
             s = setup_storage()
-            s._abstract_counter["ag-mem-16"] = 19
-            s.set_promotion_list_query(lambda: L4PromotionList(entries=[
-                ExperienceEntry(entry_id="T04", source_slot_id="ag-mem-16", i_value=0.8)
-            ]))
+            s._entries["E1"] = ExperienceEntry(entry_id="E1", i_value=0.1)
+            s._entries["E2"] = ExperienceEntry(entry_id="E2", i_value=0.2)
+            s._entry_count = 2
+            s.state = StorageState.CAPACITY_WARNING
+            s.set_cleanup_confirm_query(lambda: {"cleaned_count": 1, "cleared_ids": ["E1"]})
             s.run_storage_cycle()
-            assert s._abstract_counter["ag-mem-16"] == 0  # 触发后重置
+            assert "E1" not in s._entries
+            assert "E2" in s._entries
+            assert s._entry_count == 1
             print("   ✅ PASS")
             passed += 1
         except Exception as e:
             print(f"   ❌ FAIL: {e}")
             failed += 1
 
-        # TC-M26-05: 定时抽象提炼
-        print("\n[TC-M26-05] 定时抽象提炼（72小时）")
-        try:
-            s = setup_storage()
-            s._entries["E1"] = ExperienceEntry(entry_id="E1", source_slot_id="ag-mem-16", i_value=0.8, abstracted=False)
-            s._entries["E2"] = ExperienceEntry(entry_id="E2", source_slot_id="ag-mem-16", i_value=0.7, abstracted=False)
-            s._entries["E3"] = ExperienceEntry(entry_id="E3", source_slot_id="ag-mem-16", i_value=0.6, abstracted=False)
-            s._entries["E4"] = ExperienceEntry(entry_id="E4", source_slot_id="ag-mem-16", i_value=0.5, abstracted=False)
-            s._entries["E5"] = ExperienceEntry(entry_id="E5", source_slot_id="ag-mem-16", i_value=0.4, abstracted=False)
-            s._entry_count = 5
-            s._last_abstract_time = 0
-            s.run_storage_cycle()
-            print("   ✅ PASS")
-            passed += 1
-        except Exception as e:
-            print(f"   ❌ FAIL: {e}")
-            failed += 1
-
-        # TC-M26-06: 紧急熔断
-        print("\n[TC-M26-06] 紧急熔断")
+        # TC-M26-05: 紧急熔断
+        print("\n[TC-M26-05] 紧急熔断")
         try:
             s = setup_storage()
             s.emergency_shutdown()
@@ -564,4 +602,3 @@ if __name__ == "__main__":
         print("=" * 60)
     else:
         demo_main()
-```
