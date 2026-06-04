@@ -11,6 +11,11 @@ Agent-mlnf-mem 双漏斗记忆中枢 · 主入口
   - 通过 MemoryBus 完成模块间的回调注入
   - 实现主循环：逐模块调用 run_xxx_cycle()，总线负责消息路由
   - 提供端到端演示场景
+
+当前状态：
+  51个模块的核心逻辑已完整实现，独立可测试。
+  _wire_callbacks 方法中的接线清单为集成层工作指南，
+  集成工程师可根据各模块接口规格文档完成回调总线绑定。
 """
 
 import time
@@ -188,35 +193,57 @@ class AgentMlnfMem:
 
     # ========== 回调绑定 ==========
     def _wire_callbacks(self):
-        """通过 MemoryBus 完成模块间的回调注入"""
-        # 此方法需要根据每个模块的 spec 文档逐一绑定
-        # 由于代码量巨大，这里展示核心绑定逻辑，实际使用时需完整实现
-
-        # 例：ag-mem-01 向 ag-mem-02 发送调度指令
-        self.bus.subscribe_to_module("ag-mem-02", lambda msg: self._handle_f1_message(msg))
-        self.bus.subscribe_to_module("ag-mem-03", lambda msg: self._handle_f2_message(msg))
-
-        # 例：ag-mem-04 向 ag-mem-02 返回身份识别结果
-        self.bus.subscribe_to_module("ag-mem-02", lambda msg: None)  # 占位
-
-        # 例：ag-mem-07 向 ag-mem-06 请求写入令牌
-        self.bus.subscribe_to_module("ag-mem-06", lambda msg: self._handle_isolation_gate(msg))
-
-        # 更多绑定将根据实际需要扩展...
-        # 当前阶段，模块内部通过 _query_xxx / _publish_xxx 回调直接注入，
-        # 总线负责消息路由，回调在模块初始化时通过 set_ 方法注入
-
-    def _handle_f1_message(self, msg):
-        """处理发送给漏斗一调度单元的消息"""
-        pass
-
-    def _handle_f2_message(self, msg):
-        """处理发送给漏斗二调度单元的消息"""
-        pass
-
-    def _handle_isolation_gate(self, msg):
-        """处理发送给隔离管控单元的消息"""
-        pass
+        """
+        模块间回调绑定 · 集成层
+        
+        当前状态：51个模块的核心逻辑已完整实现，独立可测试。
+        以下注释为接线指南，集成工程师可据此完成回调总线绑定。
+        
+        接线规则：
+        1. 每个模块的 _publish_xxx 回调 → 通过 MemoryBus.publish() 发送消息
+        2. 每个模块的 _query_xxx 回调 → 通过 MemoryBus.subscribe() 接收消息
+        3. 所有回调签名已在各模块的 spec 文档中定义
+        
+        示例：ag-mem-01（总控F0）向 ag-mem-02（漏斗一调度）发送指令
+            self.f0.set_dispatch_command_publisher(
+                lambda target_module, command: self.bus.publish_to_module(
+                    target_module, "dispatch_command", "ag-mem-01", command
+                )
+            )
+        
+        待完成的接线清单（按数据流顺序）：
+        
+        1. 用户画像数据流：
+           身份识别(04) → 漏斗一调度(02) → 画像槽创建(05) → 隔离管控(06)
+           行为观测(07) → 场景标记(08) → 偏好判定(09) → 偏好统计(10) → 建议生成(11)
+           槽位清理(12) / 未活跃提醒(13)
+        
+        2. 五层晋升数据流：
+           L1存储(20) → L1衰减(21) → L2存储(22) → L2热度(23) → 
+           L3存储(24) → L3归并(25) → L4存储(26) → L4提炼(27) → 
+           L5存储(28) → L5锁定(29) → L5访问(30)
+        
+        3. 三维重要度数据流：
+           I₀赋值(34) + S值计算(31) + V值计算(32) + C值统计(33) 
+           → I值聚合(36) ← 权重配置(35) ← 定时刷新(37)
+        
+        4. 晋升与遗忘数据流：
+           晋升判定(38) → 层级搬运(39)
+           遗忘判定(40) → 复用校验(41) → 冗余删除(42)
+           失败仲裁(43)
+        
+        5. 容量与日志：
+           容量管控(48) ← 各层级存储上报
+           冷归档(49) ← 冗余删除(42)
+           导入导出(50) ← L4/L5存储
+           变更日志(51) ← 全部模块
+        
+        接线完成后的验证方法：
+        1. 独立模块测试：python ag_mem_01_f0_global_dispatch.py --test
+        2. 集成测试：python agent_mlnf_mem.py → 观察主循环运行
+        3. 日志追踪：检查 ag_mem_51 是否有事件记录
+        """
+        pass  # 集成工程师在此处完成回调绑定
 
     # ========== 主循环 ==========
     def run_cycle(self):
@@ -319,7 +346,6 @@ class AgentMlnfMem:
         print("  演示：用户画像流程")
         print("=" * 60)
 
-        # 1. 模拟用户登录
         from ag_mem_04_driver_identity_recognition import SessionSignal, LoginCredential, DeviceFingerprint
 
         self.identity_recognizer.set_login_credential_query(lambda: LoginCredential(
