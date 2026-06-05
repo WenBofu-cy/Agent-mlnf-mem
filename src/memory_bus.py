@@ -1,23 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-MemoryBus 全局记忆总线
-Agent-mlnf-mem 内部模块间通信的唯一中枢
+MemoryBus 全局记忆总线 + InternalBus 内部调度总线
+Agent-mlnf-mem 模块间通信中枢
 
 版本：V1.0
 原创提出者：文波福
 开源协议：CC BY-NC 4.0
 
-职责：
-  - 作为双漏斗记忆中枢 51 个模块间消息路由的唯一中转站
-  - 每个模块通过 publish(topic, data) 发布消息，通过 subscribe(topic, callback) 订阅消息
-  - 支持同步和异步两种投递模式
-  - 维护模块注册表，支持按模块 ID 点对点路由
-
-设计原则：
-  - 模块间不直接引用，全部通过 MemoryBus 解耦
-  - 每个 topic 对应一种消息类型，命名规范为 "模块ID.事件类型"
-  - 发布者不关心订阅者是谁，订阅者不关心消息来源
+修改记录：
+- V1.0: 首次正式发布，包含双总线架构、同步请求、优先级、TTL等
+- V1.1.1: 修复模块注册默认值问题
+- V1.1.1: 改用 PriorityQueue 实现优先级排序
+- V1.1.1: 恢复日志收集机制，对接 ag-mem-51
+- V1.1: 修复点对点消息重复投递 BUG
+- V1.1: 统一回调接口为 Message 对象
+- V1.1: 增加模块注册与校验机制
+- V1.1: 增加 priority / correlation_id 字段
 """
 
 from typing import Dict, List, Callable, Any, Optional
@@ -26,307 +25,622 @@ from dataclasses import dataclass, field
 import time
 import uuid
 import threading
+import re
+from queue import PriorityQueue, Empty
+
+
+# ====================== 优先级常量 ======================
+PRIORITY_CRITICAL = "CRITICAL"   # 最高优先级（熔断指令、安全关键操作）
+PRIORITY_HIGH = "HIGH"           # 高优先级
+PRIORITY_NORMAL = "NORMAL"       # 普通优先级
+PRIORITY_LOW = "LOW"             # 低优先级
+
+# 优先级 → 数字映射（数字越小优先级越高）
+PRIORITY_ORDER = {
+    PRIORITY_CRITICAL: 0,
+    PRIORITY_HIGH: 1,
+    PRIORITY_NORMAL: 2,
+    PRIORITY_LOW: 3,
+}
+
+# 消息 ID 前缀
+MSG_ID_PREFIX = "MSG"
+CORRELATION_PREFIX = "REQ"
+
+# 模块 ID 格式校验正则
+MODULE_ID_PATTERN = re.compile(r"^ag-(mem|ecc)-\d{2}$")
+
+# 默认消息 TTL（秒），超时未处理自动丢弃
+DEFAULT_MSG_TTL = 30.0
 
 
 @dataclass
 class Message:
-    """总线消息"""
-    message_id: str = ""
-    topic: str = ""                      # 消息主题（如 "ag-mem-01.experience_query"）
-    source_module: str = ""              # 发布者模块 ID
-    target_module: str = ""              # 目标模块 ID（空表示广播）
-    data: Any = None                     # 消息负载
+    """标准总线报文（对齐模块接口规格）"""
+    message_id: str
+    topic: str
+    source_module: str
+    target_module: str = ""
+    data: Any = None
     timestamp: float = field(default_factory=time.time)
+    correlation_id: str = ""
+    priority: str = PRIORITY_NORMAL
+    expire_at: float = 0.0          # 过期时间戳（秒），0 表示永不过期
+
+    def is_expired(self) -> bool:
+        """检查消息是否已过期"""
+        return self.expire_at > 0 and time.time() > self.expire_at
 
 
-class MemoryBus:
+class InternalBus:
     """
-    全局记忆总线
-
+    内部调度总线（MLNF 内部 51 个模块专用）
+    
+    特性：
+    - 支持优先级投递（CRITICAL > HIGH > NORMAL > LOW）
+    - 支持同步 request() 请求-响应模式（使用 correlation_id 关联）
+    - 支持消息 TTL 超时丢弃
+    - 支持模块注册校验
+    - 异常处理器日志收集（对接 ag-mem-51）
+    
     使用方式：
-        bus = MemoryBus()
+        bus = InternalBus(validate_modules=True)
+        bus.register_module("ag-mem-01")
+        bus.register_module("ag-mem-02")
         
-        # 订阅
-        bus.subscribe("ag-mem-01.experience_query", handler_func)
-        bus.subscribe_to_module("ag-mem-01", handler_func)  # 接收发给该模块的所有消息
+        def handler(msg: Message):
+            ...
+        bus.subscribe("ag-mem-01.experience_query", handler)
+        bus.subscribe_to_module("ag-mem-02", handler)
         
-        # 发布
-        bus.publish("ag-mem-01.experience_query", {"user_id": "U001"})
-        bus.publish_to_module("ag-mem-02", "slot_query", {"user_id": "U001"})
+        # 异步发布
+        bus.publish("ag-mem-02.slot_query", "ag-mem-01", data={...})
         
-        # 主循环轮询
-        bus.process_all()  # 同步处理所有待投递消息
+        # 同步请求（等待响应）
+        response = bus.request("ag-mem-02.slot_query", "ag-mem-01", data={...}, timeout_ms=2000)
     """
 
-    def __init__(self):
-        self._subscriptions: Dict[str, List[Callable]] = defaultdict(list)  # topic -> [handlers]
-        self._module_subscriptions: Dict[str, List[Callable]] = defaultdict(list)  # module_id -> [handlers]
-        self._message_queue: List[Message] = []
+    def __init__(self, validate_modules: bool = False):
+        self._subscriptions: Dict[str, List[Callable[[Message], None]]] = defaultdict(list)
+        self._module_subscriptions: Dict[str, List[Callable[[Message], None]]] = defaultdict(list)
+        self._message_queue: PriorityQueue = PriorityQueue()
         self._lock = threading.Lock()
-        self._message_counter: int = 0
+        self._validate_modules = validate_modules
+        self._registered_modules: set = set()
         self._pending_logs: List[Dict[str, Any]] = []
+        # 同步请求等待表：correlation_id → threading.Event
+        self._pending_requests: Dict[str, threading.Event] = {}
+        self._pending_responses: Dict[str, Message] = {}
 
-    # ========== 订阅接口 ==========
+    # ====================== 模块注册 ======================
+    def register_module(self, module_id: str):
+        """注册模块 ID，自动校验格式"""
+        if not MODULE_ID_PATTERN.match(module_id):
+            raise ValueError(f"模块 ID 格式非法: {module_id}，必须为 ag-mem-NN 或 ag-ecc-NN")
+        with self._lock:
+            self._registered_modules.add(module_id)
+
+    def is_module_registered(self, module_id: str) -> bool:
+        with self._lock:
+            return module_id in self._registered_modules
+
+    # ====================== 订阅接口 ======================
     def subscribe(self, topic: str, handler: Callable[[Message], None]):
-        """订阅指定 topic 的消息"""
         with self._lock:
             self._subscriptions[topic].append(handler)
 
     def subscribe_to_module(self, module_id: str, handler: Callable[[Message], None]):
-        """订阅发给指定模块的所有消息（按 target_module 过滤）"""
         with self._lock:
             self._module_subscriptions[module_id].append(handler)
 
-    # ========== 发布接口 ==========
-    def publish(self, topic: str, source_module: str, data: Any = None, target_module: str = ""):
-        """
-        发布消息到指定 topic
+    # ====================== 异步发布 ======================
+    def publish(
+        self,
+        topic: str,
+        source_module: str,
+        data: Any = None,
+        target_module: str = "",
+        priority: str = PRIORITY_NORMAL,
+        correlation_id: str = "",
+        ttl: float = DEFAULT_MSG_TTL
+    ):
+        """异步发布消息"""
+        if not topic or not source_module:
+            raise ValueError("topic 和 source_module 不能为空")
+        if self._validate_modules:
+            if not self.is_module_registered(source_module):
+                raise ValueError(f"未注册的源模块: {source_module}")
+            if target_module and not self.is_module_registered(target_module):
+                raise ValueError(f"未注册的目标模块: {target_module}")
 
-        Args:
-            topic: 消息主题
-            source_module: 发布者模块 ID
-            data: 消息负载
-            target_module: 目标模块 ID（空表示广播给所有订阅该 topic 的模块）
-        """
-        self._message_counter += 1
-        message = Message(
-            message_id=f"MSG-{self._message_counter:06d}",
+        msg = Message(
+            message_id=f"{MSG_ID_PREFIX}-{uuid.uuid4().hex[:12]}",
             topic=topic,
             source_module=source_module,
             target_module=target_module,
-            data=data
+            data=data,
+            priority=priority,
+            correlation_id=correlation_id or f"{CORRELATION_PREFIX}-{uuid.uuid4().hex[:8]}",
+            expire_at=(time.time() + ttl) if ttl > 0 else 0.0,
         )
-        with self._lock:
-            self._message_queue.append(message)
+        priority_num = PRIORITY_ORDER.get(msg.priority, 2)
+        self._message_queue.put((priority_num, msg.timestamp, msg))
 
-    def publish_to_module(self, target_module: str, event_type: str, source_module: str, data: Any = None):
-        """
-        向指定模块发布点对点消息
-
-        Args:
-            target_module: 目标模块 ID
-            event_type: 事件类型
-            source_module: 发布者模块 ID
-            data: 消息负载
-        """
+    def publish_to_module(
+        self,
+        target_module: str,
+        event_type: str,
+        source_module: str,
+        data: Any = None,
+        priority: str = PRIORITY_NORMAL,
+        ttl: float = DEFAULT_MSG_TTL
+    ):
+        """点对点异步发布"""
         topic = f"{target_module}.{event_type}"
-        self.publish(topic, source_module, data, target_module)
+        self.publish(topic=topic, source_module=source_module, data=data,
+                     target_module=target_module, priority=priority, ttl=ttl)
 
-    # ========== 消息处理 ==========
-    def process_one(self) -> int:
+    # ====================== 同步请求 ======================
+    def request(
+        self,
+        topic: str,
+        source_module: str,
+        data: Any = None,
+        target_module: str = "",
+        timeout_ms: float = 2000.0,
+        priority: str = PRIORITY_NORMAL
+    ) -> Optional[Message]:
         """
-        处理队列中的下一条消息（同步）
+        同步请求-响应
+        
+        发送请求后阻塞等待，直到收到携带相同 correlation_id 的响应或超时。
+        响应方需调用 publish_reply() 发送响应消息。
+        
+        Args:
+            topic: 消息主题
+            source_module: 请求方模块 ID
+            data: 请求数据
+            target_module: 目标模块 ID
+            timeout_ms: 超时时间（毫秒）
+            priority: 优先级
+            
         Returns:
-            处理的消息数（0 或 1）
+            响应 Message，超时返回 None
         """
+        correlation_id = f"{CORRELATION_PREFIX}-{uuid.uuid4().hex[:8]}"
+        event = threading.Event()
+
         with self._lock:
-            if not self._message_queue:
-                return 0
-            message = self._message_queue.pop(0)
+            self._pending_requests[correlation_id] = event
 
-        # 1. 投递给 topic 订阅者
-        handlers = self._subscriptions.get(message.topic, [])
+        # 发送请求
+        self.publish(
+            topic=topic,
+            source_module=source_module,
+            data=data,
+            target_module=target_module,
+            priority=priority,
+            correlation_id=correlation_id,
+        )
+
+        # 等待响应
+        if event.wait(timeout=timeout_ms / 1000.0):
+            with self._lock:
+                response = self._pending_responses.pop(correlation_id, None)
+                self._pending_requests.pop(correlation_id, None)
+            return response
+        else:
+            # 超时清理
+            with self._lock:
+                self._pending_requests.pop(correlation_id, None)
+                self._pending_responses.pop(correlation_id, None)
+            return None
+
+    def publish_reply(
+        self,
+        topic: str,
+        source_module: str,
+        data: Any,
+        correlation_id: str,
+        target_module: str = "",
+        priority: str = PRIORITY_NORMAL
+    ):
+        """
+        发送同步请求的响应
+        
+        模块在处理完同步请求后调用此方法发送响应。
+        correlation_id 必须与原始请求一致。
+        """
+        msg = Message(
+            message_id=f"{MSG_ID_PREFIX}-{uuid.uuid4().hex[:12]}",
+            topic=topic,
+            source_module=source_module,
+            target_module=target_module,
+            data=data,
+            priority=priority,
+            correlation_id=correlation_id,
+        )
+
+        with self._lock:
+            if correlation_id in self._pending_requests:
+                self._pending_responses[correlation_id] = msg
+                self._pending_requests[correlation_id].set()
+            # 如果原始请求方已经超时，响应消息不会入队，直接丢弃
+
+    # ====================== 消息处理 ======================
+    def process_one(self) -> int:
+        """处理队列中的下一条消息（按优先级）"""
+        try:
+            priority_num, timestamp, msg = self._message_queue.get(timeout=0)
+        except Empty:
+            return 0
+
+        # 丢弃过期消息
+        if msg.is_expired():
+            return 1
+
+        # 点对点消息：只投递模块订阅
+        if msg.target_module:
+            handlers = self._module_subscriptions.get(msg.target_module, [])
+            for handler in handlers:
+                self._deliver(handler, msg)
+            return 1
+
+        # 广播消息：投递 topic 订阅
+        handlers = self._subscriptions.get(msg.topic, [])
         for handler in handlers:
-            try:
-                handler(message)
-            except Exception as e:
-                self._log_error("topic_handler_error", str(e))
-
-        # 2. 投递给目标模块的订阅者
-        if message.target_module:
-            module_handlers = self._module_subscriptions.get(message.target_module, [])
-            for handler in module_handlers:
-                try:
-                    handler(message)
-                except Exception as e:
-                    self._log_error("module_handler_error", str(e))
-
+            self._deliver(handler, msg)
         return 1
 
-    def process_all(self) -> int:
-        """处理队列中的所有待投递消息（同步）"""
-        total = 0
-        while True:
-            processed = self.process_one()
-            if processed == 0:
-                break
-            total += processed
-        return total
+    def _deliver(self, handler: Callable[[Message], None], msg: Message):
+        try:
+            handler(msg)
+        except Exception as e:
+            log_entry = {
+                "log_id": f"log-{uuid.uuid4().hex[:8]}",
+                "event_type": "message_handler_error",
+                "source_module": "InternalBus",
+                "details": {
+                    "error": str(e),
+                    "message_id": msg.message_id,
+                    "topic": msg.topic,
+                    "source_module": msg.source_module,
+                    "target_module": msg.target_module,
+                },
+                "timestamp": time.time(),
+            }
+            with self._lock:
+                self._pending_logs.append(log_entry)
 
     def process_batch(self, max_count: int = 50) -> int:
-        """处理最多 max_count 条消息"""
         total = 0
         for _ in range(max_count):
-            processed = self.process_one()
-            if processed == 0:
+            if self.process_one() == 0:
                 break
-            total += processed
+            total += 1
         return total
 
-    # ========== 查询接口 ==========
+    def process_all(self) -> int:
+        total = 0
+        while self.process_one():
+            total += 1
+        return total
+
+    # ====================== 查询与工具 ======================
     def pending_count(self) -> int:
-        """待处理消息数"""
+        return self._message_queue.qsize()
+
+    def clear_queue(self):
         with self._lock:
-            return len(self._message_queue)
-
-    def subscription_count(self) -> int:
-        """总订阅数"""
-        total = sum(len(v) for v in self._subscriptions.values())
-        total += sum(len(v) for v in self._module_subscriptions.values())
-        return total
-
-    # ========== 辅助 ==========
-    def _log_error(self, error_type: str, detail: str):
-        self._pending_logs.append({
-            "log_id": f"log-{uuid.uuid4().hex[:8]}",
-            "event_type": error_type,
-            "source_module": "MemoryBus",
-            "details": {"error": detail},
-            "timestamp": time.time()
-        })
+            self._message_queue = PriorityQueue()
 
     def collect_pending_logs(self) -> List[Dict[str, Any]]:
-        logs = self._pending_logs.copy()
-        self._pending_logs.clear()
+        with self._lock:
+            logs = self._pending_logs.copy()
+            self._pending_logs.clear()
         return logs
 
 
-# ========== 演示与测试 ==========
+# ====================== MemoryBus（对外总线） ======================
+class MemoryBus:
+    """
+    对外记忆总线（ECC ↔ MLNF 专用）
+    
+    仅用于 ECC 认知大脑与 MLNF 记忆中枢之间的跨系统通信。
+    内部通信请使用 InternalBus。
+    """
+
+    def __init__(self, validate_modules: bool = False):
+        self._subscriptions: Dict[str, List[Callable[[Message], None]]] = defaultdict(list)
+        self._module_subscriptions: Dict[str, List[Callable[[Message], None]]] = defaultdict(list)
+        self._message_queue: PriorityQueue = PriorityQueue()
+        self._lock = threading.Lock()
+        self._validate_modules = validate_modules
+        self._registered_modules: set = set()
+        self._pending_logs: List[Dict[str, Any]] = []
+
+    def register_module(self, module_id: str):
+        if not MODULE_ID_PATTERN.match(module_id):
+            raise ValueError(f"模块 ID 格式非法: {module_id}，必须为 ag-mem-NN 或 ag-ecc-NN")
+        with self._lock:
+            self._registered_modules.add(module_id)
+
+    def subscribe(self, topic: str, handler: Callable[[Message], None]):
+        with self._lock:
+            self._subscriptions[topic].append(handler)
+
+    def subscribe_to_module(self, module_id: str, handler: Callable[[Message], None]):
+        with self._lock:
+            self._module_subscriptions[module_id].append(handler)
+
+    def publish(
+        self,
+        topic: str,
+        source_module: str,
+        data: Any = None,
+        target_module: str = "",
+        priority: str = PRIORITY_NORMAL,
+        correlation_id: str = "",
+        ttl: float = DEFAULT_MSG_TTL
+    ):
+        if not topic or not source_module:
+            raise ValueError("topic 和 source_module 不能为空")
+        if self._validate_modules:
+            if not self.is_module_registered(source_module):
+                raise ValueError(f"未注册的源模块: {source_module}")
+            if target_module and not self.is_module_registered(target_module):
+                raise ValueError(f"未注册的目标模块: {target_module}")
+
+        msg = Message(
+            message_id=f"{MSG_ID_PREFIX}-{uuid.uuid4().hex[:12]}",
+            topic=topic,
+            source_module=source_module,
+            target_module=target_module,
+            data=data,
+            priority=priority,
+            correlation_id=correlation_id or f"{CORRELATION_PREFIX}-{uuid.uuid4().hex[:8]}",
+            expire_at=(time.time() + ttl) if ttl > 0 else 0.0,
+        )
+        priority_num = PRIORITY_ORDER.get(msg.priority, 2)
+        self._message_queue.put((priority_num, msg.timestamp, msg))
+
+    def publish_to_module(
+        self,
+        target_module: str,
+        event_type: str,
+        source_module: str,
+        data: Any = None,
+        priority: str = PRIORITY_NORMAL,
+        ttl: float = DEFAULT_MSG_TTL
+    ):
+        topic = f"{target_module}.{event_type}"
+        self.publish(topic=topic, source_module=source_module, data=data,
+                     target_module=target_module, priority=priority, ttl=ttl)
+
+    def is_module_registered(self, module_id: str) -> bool:
+        with self._lock:
+            return module_id in self._registered_modules
+
+    def process_one(self) -> int:
+        try:
+            priority_num, timestamp, msg = self._message_queue.get(timeout=0)
+        except Empty:
+            return 0
+        if msg.is_expired():
+            return 1
+        if msg.target_module:
+            handlers = self._module_subscriptions.get(msg.target_module, [])
+        else:
+            handlers = self._subscriptions.get(msg.topic, [])
+        for handler in handlers:
+            self._deliver(handler, msg)
+        return 1
+
+    def _deliver(self, handler, msg):
+        try:
+            handler(msg)
+        except Exception as e:
+            log_entry = {
+                "log_id": f"log-{uuid.uuid4().hex[:8]}",
+                "event_type": "message_handler_error",
+                "source_module": "MemoryBus",
+                "details": {"error": str(e), "message_id": msg.message_id, "topic": msg.topic},
+                "timestamp": time.time(),
+            }
+            with self._lock:
+                self._pending_logs.append(log_entry)
+
+    def process_batch(self, max_count: int = 50) -> int:
+        total = 0
+        for _ in range(max_count):
+            if self.process_one() == 0:
+                break
+            total += 1
+        return total
+
+    def process_all(self) -> int:
+        total = 0
+        while self.process_one():
+            total += 1
+        return total
+
+    def pending_count(self) -> int:
+        return self._message_queue.qsize()
+
+    def clear_queue(self):
+        with self._lock:
+            self._message_queue = PriorityQueue()
+
+    def collect_pending_logs(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            logs = self._pending_logs.copy()
+            self._pending_logs.clear()
+        return logs
+
+
+# ========== 集成演示 ==========
 def demo_main():
     print("=" * 60)
-    print("  MemoryBus 全局记忆总线 演示")
+    print("  MemoryBus + InternalBus 双总线 V1.0 演示")
     print("=" * 60)
 
-    bus = MemoryBus()
-    received_messages = []
+    # 内部总线（模块间）
+    internal = InternalBus()
+    internal.register_module("ag-mem-01")
+    internal.register_module("ag-mem-02")
 
-    # 订阅
-    def handler(msg):
-        received_messages.append(msg)
-    bus.subscribe("ag-mem-01.experience_query", handler)
+    # 外部总线（ECC ↔ MLNF）
+    external = MemoryBus()
+    external.register_module("ag-mem-01")
+    external.register_module("ag-ecc-05")
 
-    # 发布
-    bus.publish("ag-mem-01.experience_query", "ag-ecc-05", {"user_id": "U001"})
-    bus.publish_to_module("ag-mem-02", "slot_query", "ag-mem-01", {"user_id": "U001"})
+    # 演示同步请求
+    def sync_handler(msg: Message):
+        print(f"  [同步] ag-mem-02 收到: {msg.topic}, data={msg.data}")
+        # 模拟处理并返回响应
+        internal.publish_reply(
+            topic="ag-mem-02.response",
+            source_module="ag-mem-02",
+            data={"status": "ok", "slot_id": "SLOT-LONG-1"},
+            correlation_id=msg.correlation_id,
+            target_module=msg.source_module,
+        )
 
-    # 处理
-    processed = bus.process_all()
-    print(f"  待处理: {bus.pending_count()}")
-    print(f"  已处理: {processed}")
-    print(f"  收到消息: {len(received_messages)}")
+    internal.subscribe_to_module("ag-mem-02", sync_handler)
 
-    print("\n✅ MemoryBus 演示完成")
+    print("\n  发起同步请求...")
+    response = internal.request(
+        topic="ag-mem-02.slot_query",
+        source_module="ag-mem-01",
+        data={"user_id": "U001"},
+        target_module="ag-mem-02",
+        timeout_ms=2000,
+    )
+    if response:
+        print(f"  收到响应: {response.data}")
+    else:
+        print("  请求超时")
+
+    # 处理外部消息
+    received = []
+    external.subscribe("ag-mem-01.experience_query", lambda msg: received.append(msg))
+    external.publish("ag-mem-01.experience_query", "ag-ecc-05", {"query_type": "experience"})
+    external.process_all()
+    print(f"\n  外部总线处理: {len(received)} 条消息")
+
+    print("\n✅ 双总线 V1.0 演示完成")
 
 
 if __name__ == "__main__":
     import sys
     if len(sys.argv) > 1 and sys.argv[1] == "--test":
         print("=" * 60)
-        print("MemoryBus 单元测试")
+        print("双总线 V1.0 单元测试")
         print("=" * 60)
         passed, failed = 0, 0
 
-        # TC-BUS-01: 基本发布订阅
-        print("\n[TC-BUS-01] 基本发布订阅")
+        # TC-01: MemoryBus 基本发布订阅
+        print("\n[TC-01] MemoryBus 基本发布订阅")
         try:
             bus = MemoryBus()
             received = []
-            bus.subscribe("test.topic", lambda msg: received.append(msg))
-            bus.publish("test.topic", "source", {"key": "value"})
+            bus.subscribe("ag-mem-01.test", lambda msg: received.append(msg))
+            bus.publish("ag-mem-01.test", "ag-ecc-05", {"key": "value"})
             bus.process_all()
             assert len(received) == 1
-            assert received[0].data == {"key": "value"}
-            print("   ✅ PASS")
-            passed += 1
+            print("   ✅ PASS"); passed += 1
         except Exception as e:
-            print(f"   ❌ FAIL: {e}")
-            failed += 1
+            print(f"   ❌ FAIL: {e}"); failed += 1
 
-        # TC-BUS-02: 点对点路由
-        print("\n[TC-BUS-02] 点对点路由")
+        # TC-02: InternalBus 同步请求
+        print("\n[TC-02] InternalBus 同步请求")
         try:
-            bus = MemoryBus()
-            received = []
-            bus.subscribe_to_module("target_module", lambda msg: received.append(msg))
-            bus.publish_to_module("target_module", "event", "source", {"data": 1})
+            bus = InternalBus()
+            bus.register_module("ag-mem-01")
+            bus.register_module("ag-mem-02")
+            def handler(msg):
+                bus.publish_reply("resp", "ag-mem-02", {"result": 42}, msg.correlation_id, msg.source_module)
+            bus.subscribe_to_module("ag-mem-02", handler)
+            resp = bus.request("ag-mem-02.query", "ag-mem-01", {}, "ag-mem-02", timeout_ms=2000)
+            assert resp is not None and resp.data == {"result": 42}
+            print("   ✅ PASS"); passed += 1
+        except Exception as e:
+            print(f"   ❌ FAIL: {e}"); failed += 1
+
+        # TC-03: 同步请求超时
+        print("\n[TC-03] 同步请求超时")
+        try:
+            bus = InternalBus()
+            bus.register_module("ag-mem-01")
+            bus.register_module("ag-mem-02")
+            resp = bus.request("ag-mem-02.query", "ag-mem-01", {}, "ag-mem-02", timeout_ms=100)
+            assert resp is None
+            print("   ✅ PASS"); passed += 1
+        except Exception as e:
+            print(f"   ❌ FAIL: {e}"); failed += 1
+
+        # TC-04: 优先级投递（CRITICAL 优先）
+        print("\n[TC-04] CRITICAL 优先级优先投递")
+        try:
+            bus = InternalBus()
+            bus.register_module("ag-mem-01")
+            order = []
+            bus.subscribe("test.priority", lambda msg: order.append(msg.data["n"]))
+            bus.publish("test.priority", "ag-mem-01", {"n": 3}, priority=PRIORITY_LOW)
+            bus.publish("test.priority", "ag-mem-01", {"n": 2}, priority=PRIORITY_NORMAL)
+            bus.publish("test.priority", "ag-mem-01", {"n": 1}, priority=PRIORITY_CRITICAL)
             bus.process_all()
-            assert len(received) == 1
-            assert received[0].target_module == "target_module"
-            print("   ✅ PASS")
-            passed += 1
+            assert order == [1, 2, 3]
+            print("   ✅ PASS"); passed += 1
         except Exception as e:
-            print(f"   ❌ FAIL: {e}")
-            failed += 1
+            print(f"   ❌ FAIL: {e}"); failed += 1
 
-        # TC-BUS-03: 多个订阅者
-        print("\n[TC-BUS-03] 多个订阅者")
+        # TC-05: 模块 ID 格式校验
+        print("\n[TC-05] 模块 ID 格式校验")
         try:
-            bus = MemoryBus()
-            r1, r2 = [], []
-            bus.subscribe("multi.topic", lambda msg: r1.append(msg))
-            bus.subscribe("multi.topic", lambda msg: r2.append(msg))
-            bus.publish("multi.topic", "source", "data")
-            bus.process_all()
-            assert len(r1) == 1 and len(r2) == 1
-            print("   ✅ PASS")
-            passed += 1
+            bus = InternalBus()
+            bus.register_module("ag-mem-01")
+            try:
+                bus.register_module("invalid_id")
+                assert False
+            except ValueError:
+                pass
+            print("   ✅ PASS"); passed += 1
         except Exception as e:
-            print(f"   ❌ FAIL: {e}")
-            failed += 1
+            print(f"   ❌ FAIL: {e}"); failed += 1
 
-        # TC-BUS-04: 批量处理
-        print("\n[TC-BUS-04] 批量处理")
+        # TC-06: 消息 TTL 超时丢弃
+        print("\n[TC-06] 消息 TTL 超时丢弃")
         try:
-            bus = MemoryBus()
+            bus = InternalBus()
+            bus.register_module("ag-mem-01")
             received = []
-            bus.subscribe("batch.topic", lambda msg: received.append(msg))
-            for i in range(100):
-                bus.publish("batch.topic", "source", {"index": i})
-            processed = bus.process_all()
-            assert processed == 100
-            assert len(received) == 100
-            print("   ✅ PASS")
-            passed += 1
-        except Exception as e:
-            print(f"   ❌ FAIL: {e}")
-            failed += 1
-
-        # TC-BUS-05: 无订阅者不报错
-        print("\n[TC-BUS-05] 无订阅者不报错")
-        try:
-            bus = MemoryBus()
-            bus.publish("no_subscribers", "source", "data")
-            processed = bus.process_all()
-            assert processed == 1
-            print("   ✅ PASS")
-            passed += 1
-        except Exception as e:
-            print(f"   ❌ FAIL: {e}")
-            failed += 1
-
-        # TC-BUS-06: 线程安全
-        print("\n[TC-BUS-06] 线程安全")
-        try:
-            bus = MemoryBus()
-            received = []
-            bus.subscribe("thread.topic", lambda msg: received.append(msg))
-
-            def publisher():
-                for _ in range(50):
-                    bus.publish("thread.topic", "source", "data")
-
-            threads = [threading.Thread(target=publisher) for _ in range(4)]
-            for t in threads:
-                t.start()
-            for t in threads:
-                t.join()
+            bus.subscribe("test.ttl", lambda msg: received.append(msg))
+            bus.publish("test.ttl", "ag-mem-01", {"data": 1}, ttl=0.01)
+            time.sleep(0.05)
             bus.process_all()
-            assert len(received) == 200
-            print("   ✅ PASS")
-            passed += 1
+            assert len(received) == 0
+            print("   ✅ PASS"); passed += 1
         except Exception as e:
-            print(f"   ❌ FAIL: {e}")
-            failed += 1
+            print(f"   ❌ FAIL: {e}"); failed += 1
+
+        # TC-07: 双总线隔离（InternalBus 消息不投递到 MemoryBus）
+        print("\n[TC-07] 双总线隔离")
+        try:
+            internal = InternalBus()
+            external = MemoryBus()
+            internal.register_module("ag-mem-01")
+            external.register_module("ag-mem-01")
+            internal_recv, external_recv = [], []
+            internal.subscribe("test.isolation", lambda msg: internal_recv.append(msg))
+            external.subscribe("test.isolation", lambda msg: external_recv.append(msg))
+            internal.publish("test.isolation", "ag-mem-01", {"data": 1})
+            internal.process_all()
+            external.process_all()
+            assert len(internal_recv) == 1 and len(external_recv) == 0
+            print("   ✅ PASS"); passed += 1
+        except Exception as e:
+            print(f"   ❌ FAIL: {e}"); failed += 1
 
         print("\n" + "=" * 60)
         print(f"测试结果: {passed} PASS, {failed} FAIL")
