@@ -23,7 +23,7 @@
   S-04: 本模块不持久化原始行为数据，仅保留生成的偏好标签结果
   S-05: 负面偏好标签的置信度必须高于 0.7 才能输出，避免误判
 
-版本: V1.0 (CPEC 标签对齐)
+版本: V1.0 (CPEC 标签对齐 · 原始行为字段透传)
 """
 
 import time
@@ -32,7 +32,6 @@ from typing import Any, Dict, List, Optional
 from enum import Enum
 
 from memory_bus import InternalBus, Message
-# 直接导入 ag-mem-07 的行为类型枚举，消除硬编码不一致
 from ag_mem_07_behavior_observation import BehaviorType
 
 
@@ -56,6 +55,7 @@ class PreferenceLabel:
     def __init__(self, label_id: str = "", user_id: str = "", slot_id: str = "",
                  scene_category: str = "", label_dimension: str = "", label_value: str = "",
                  preference_type: str = "", confidence: float = 0.0, source_behavior_id: str = "",
+                 behavior_type: str = "", behavior_params: Optional[Dict[str, Any]] = None,
                  timestamp: float = None):
         self.label_id = label_id
         self.user_id = user_id
@@ -66,6 +66,8 @@ class PreferenceLabel:
         self.preference_type = preference_type
         self.confidence = confidence
         self.source_behavior_id = source_behavior_id
+        self.behavior_type = behavior_type
+        self.behavior_params = behavior_params or {}
         self.timestamp = timestamp or time.time()
 
     def to_dict(self) -> Dict[str, Any]:
@@ -87,7 +89,7 @@ class PreferenceLabelJudge:
         self.bus: Optional[InternalBus] = None
 
         self.state = LabelingState.IDLE
-        self._current_scene: str = "general"  # 默认通用场景
+        self._current_scene: str = "general"
         self._label_cache: List[PreferenceLabel] = []
         self._baseline: Optional[Dict[str, Any]] = None
         self._behavior_counts: Dict[str, Any] = {}
@@ -116,7 +118,6 @@ class PreferenceLabelJudge:
             self._handle_scene_switch(msg)
             return
 
-        # 接收来自 ag-mem-10 的历史偏好基线
         if msg.topic == "ag-mem-09.preference_baseline":
             self._baseline = msg.data
             self._log_event("BASELINE_RECEIVED", {"has_data": bool(msg.data)})
@@ -194,7 +195,9 @@ class PreferenceLabelJudge:
                 label_value=value,
                 preference_type=pref_type.value,
                 confidence=confidence,
-                source_behavior_id=entry_id
+                source_behavior_id=entry_id,
+                behavior_type=btype,          # 透传原始行为类型
+                behavior_params=params.copy() # 透传原始行为参数
             )
 
         # ---------- 显式反馈 ----------
