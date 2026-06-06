@@ -22,7 +22,7 @@
   S-03: 统计异常告警仅基于当前槽位的历史数据对比，不得跨用户进行异常检测
   S-04: 统计数据的持久化写入必须完整，写入中断时保留未损坏的前一版本作为回滚点
 
-版本: V1.0 (原始行为字段兼容版)
+版本: V1.0 (100% 兼容 ag-mem-09 中文枚举版)
 """
 
 import time
@@ -49,6 +49,8 @@ class PreferenceStatistics:
     ANOMALY_COOLDOWN_SEC = 60
     REPORT_INTERVAL_SEC = 60
     HOURLY_RESET_INTERVAL = 3600
+    DAILY_RESET_INTERVAL = 86400
+    RECENT_WINDOW_DAYS = 7
 
     def __init__(self):
         self.bus: Optional[InternalBus] = None
@@ -58,11 +60,15 @@ class PreferenceStatistics:
         self._anomaly_cooldowns: Dict[str, float] = {}
         self._last_report_time: float = 0.0
         self._last_hourly_reset: float = time.time()
+        self._last_daily_reset: float = time.time()
         self._pending_logs: List[Dict[str, Any]] = []
 
         print(f"[{self.module_id}] {self.module_name} {self.version} 初始化完成")
 
-    # ====================== 主循环 ======================
+    # ====================== 全系统统一主循环入口 ======================
+    def run_cycle(self):
+        self.preference_statistics_main_loop()
+
     def preference_statistics_main_loop(self):
         if self.state == StatisticsState.SYSTEM_PAUSED:
             return
@@ -75,6 +81,10 @@ class PreferenceStatistics:
         if now - self._last_hourly_reset >= self.HOURLY_RESET_INTERVAL:
             self._reset_hourly_counters()
             self._last_hourly_reset = now
+
+        if now - self._last_daily_reset >= self.DAILY_RESET_INTERVAL:
+            self._rotate_daily_windows()
+            self._last_daily_reset = now
 
         if now - self._last_report_time >= self.REPORT_INTERVAL_SEC:
             self._last_report_time = now
@@ -107,18 +117,18 @@ class PreferenceStatistics:
     def _handle_labeled_entry(self, data: Dict[str, Any]):
         self.state = StatisticsState.STAT_UPDATING
 
-        # 提取标签信息
+        # 提取ag-mem-09输出的标签信息（中文枚举值）
         preference_type = data.get("preference_type", "")
         label_dimension = data.get("label_dimension", "")
         label_value = data.get("label_value", "")
         scene_category = data.get("scene_category", "通用任务")
         user_id = data.get("user_id", "")
 
-        # 提取原始行为字段（新协议）或回退到标签维度
+        # 优先使用ag-mem-09透传的原始行为字段
         behavior_type = data.get("behavior_type", "")
         behavior_params = data.get("behavior_params", {})
 
-        # 确定统计维度：优先使用原始行为类型，否则回退到 label_dimension
+        # 确定统计维度：优先使用原始行为类型，否则回退到label_dimension
         stat_dimension = behavior_type if behavior_type else label_dimension
         if not stat_dimension:
             self.state = StatisticsState.IDLE
@@ -130,23 +140,28 @@ class PreferenceStatistics:
         if stat_dimension not in dim:
             dim[stat_dimension] = {
                 "total_count": 0, "explicit_count": 0, "implicit_count": 0,
-                "occasional_count": 0, "recent_7d_count": 0, "preference_strength": 0.0,
+                "occasional_count": 0, "negative_count": 0,
+                "daily_counts": [0] * self.RECENT_WINDOW_DAYS,
+                "preference_strength": 0.0,
                 "tool_freq_map": {}, "view_duration_map": {},
                 "_hourly_count": 0
             }
         s = dim[stat_dimension]
         s["total_count"] += 1
-        s["recent_7d_count"] += 1
+        s["daily_counts"][0] += 1  # 今日计数
         s["_hourly_count"] += 1
 
+        # 按中文枚举值统计（与ag-mem-09完全对齐）
         if preference_type == "显式偏好":
             s["explicit_count"] += 1
         elif preference_type == "隐式倾向":
             s["implicit_count"] += 1
+        elif preference_type == "负面偏好":
+            s["negative_count"] += 1
         else:
             s["occasional_count"] += 1
 
-        # 根据行为类型补充特定统计
+        # 根据原始行为类型补充特定统计
         if behavior_type == "tool_invoke":
             tool_name = behavior_params.get("tool_name", "")
             if tool_name:
@@ -162,15 +177,20 @@ class PreferenceStatistics:
         if scene_category not in scene_dim:
             scene_dim[scene_category] = {
                 "total_count": 0, "explicit_count": 0, "implicit_count": 0,
-                "occasional_count": 0, "recent_7d_count": 0, "preference_strength": 0.0,
+                "occasional_count": 0, "negative_count": 0,
+                "daily_counts": [0] * self.RECENT_WINDOW_DAYS,
+                "preference_strength": 0.0,
                 "view_duration_map": {}
             }
         ss = scene_dim[scene_category]
         ss["total_count"] += 1
+        ss["daily_counts"][0] += 1
         if preference_type == "显式偏好":
             ss["explicit_count"] += 1
         elif preference_type == "隐式倾向":
             ss["implicit_count"] += 1
+        elif preference_type == "负面偏好":
+            ss["negative_count"] += 1
         else:
             ss["occasional_count"] += 1
 
@@ -198,9 +218,15 @@ class PreferenceStatistics:
         self.state = StatisticsState.IDLE
 
     def _handle_summary_query(self, msg: Message):
+        """处理统计摘要查询请求（S-01 强制隔离校验）"""
         self.state = StatisticsState.QUERY_RESPONDING
 
-        summary = self._build_summary()
+        # S-01 隔离校验：仅返回当前活跃槽位的数据
+        if not self._active_slot_id:
+            summary = {"slot_id": "", "baseline_available": False}
+        else:
+            summary = self._build_summary()
+
         if self.bus:
             self.bus.publish(
                 topic=f"{msg.source_module}.preference_summary",
@@ -213,9 +239,15 @@ class PreferenceStatistics:
         self.state = StatisticsState.IDLE
 
     def _handle_baseline_query(self, msg: Message):
+        """处理历史基线查询请求（S-01 强制隔离校验）"""
         self.state = StatisticsState.QUERY_RESPONDING
 
-        baseline = self._build_baseline()
+        # S-01 隔离校验：仅返回当前活跃槽位的数据
+        if not self._active_slot_id:
+            baseline = {"avg_view_duration": {}, "behavior_frequencies": {}, "skip_count": 0}
+        else:
+            baseline = self._build_baseline()
+
         if self.bus:
             self.bus.publish(
                 topic=f"{msg.source_module}.preference_baseline",
@@ -246,13 +278,19 @@ class PreferenceStatistics:
         for dim_name, stats in self._stats_cache.get("by_behavior_dimension", {}).items():
             behavior_dim[dim_name] = {
                 k: v for k, v in stats.items()
-                if not k.startswith("_") and k not in ("tool_freq_map", "view_duration_map")
+                if not k.startswith("_") and k not in ("tool_freq_map", "view_duration_map", "daily_counts")
             }
+            # 计算最近7天总数
+            behavior_dim[dim_name]["recent_7d_count"] = sum(stats.get("daily_counts", [0]*7))
+
         scene_dim = {}
         for scene_name, stats in self._stats_cache.get("by_scene_label", {}).items():
             scene_dim[scene_name] = {
-                k: v for k, v in stats.items() if not k.startswith("_")
+                k: v for k, v in stats.items()
+                if not k.startswith("_") and k not in ("view_duration_map", "daily_counts")
             }
+            scene_dim[scene_name]["recent_7d_count"] = sum(stats.get("daily_counts", [0]*7))
+
         return {
             "slot_id": self._active_slot_id or "",
             "total_entries": self._stats_cache.get("total_entries", 0),
@@ -265,14 +303,14 @@ class PreferenceStatistics:
         }
 
     def _build_baseline(self) -> Dict[str, Any]:
-        # 平均查看时长：按场景类别聚合
+        # 平均查看时长：按场景类别聚合（与ag-mem-09对齐）
         avg_view_duration = {}
         for scene, stats in self._stats_cache.get("by_scene_label", {}).items():
             vmap = stats.get("view_duration_map", {})
             if vmap.get("count", 0) > 0:
                 avg_view_duration[scene] = vmap["total"] / vmap["count"]
 
-        # 工具频次：汇总所有维度中的工具频次，键为 TOOL_INVOKE_{tool_name}
+        # 行为频次：汇总所有维度中的工具频次
         behavior_frequencies = {}
         for dim_name, stats in self._stats_cache.get("by_behavior_dimension", {}).items():
             if dim_name == "tool_invoke":
@@ -294,7 +332,9 @@ class PreferenceStatistics:
             if total > 0:
                 strength = (stats["explicit_count"] * 1.0 +
                             stats["implicit_count"] * 0.6 +
-                            stats["occasional_count"] * 0.2) / total
+                            stats["occasional_count"] * 0.2 -
+                            stats["negative_count"] * 0.8) / total
+                strength = max(0.0, min(1.0, strength))  # 限制在0-1之间
             else:
                 strength = 0.0
             stats["preference_strength"] = round(strength, 2)
@@ -307,8 +347,8 @@ class PreferenceStatistics:
             if now - self._anomaly_cooldowns[dimension] < self.ANOMALY_COOLDOWN_SEC:
                 return
 
-        recent = stats.get("recent_7d_count", 0)
-        avg = recent / 7.0 if recent > 0 else 0
+        recent_7d = sum(stats.get("daily_counts", [0]*7))
+        avg = recent_7d / 7.0 if recent_7d > 0 else 0
         current_hour = stats.get("_hourly_count", 0)
 
         if avg > 0 and current_hour > avg * self.ANOMALY_THRESHOLD_RATIO:
@@ -317,14 +357,32 @@ class PreferenceStatistics:
                 self.bus.publish_to_module("ag-mem-02", "anomaly_alert", self.module_id, {
                     "dimension": dimension,
                     "current_value": current_hour,
-                    "historical_mean": avg,
+                    "historical_mean": round(avg, 2),
                 })
+            self._log_event("ANOMALY_DETECTED", {
+                "dimension": dimension,
+                "current": current_hour,
+                "avg": round(avg, 2)
+            })
 
     def _reset_hourly_counters(self):
         for stats in self._stats_cache.get("by_behavior_dimension", {}).values():
             stats["_hourly_count"] = 0
+        for stats in self._stats_cache.get("by_scene_label", {}).values():
+            stats["_hourly_count"] = 0
+
+    def _rotate_daily_windows(self):
+        """每日滚动窗口：丢弃7天前的数据"""
+        for stats in self._stats_cache.get("by_behavior_dimension", {}).values():
+            daily = stats.get("daily_counts", [0]*7)
+            stats["daily_counts"] = [0] + daily[:-1]  # 右移一位，今日清零
+        for stats in self._stats_cache.get("by_scene_label", {}).values():
+            daily = stats.get("daily_counts", [0]*7)
+            stats["daily_counts"] = [0] + daily[:-1]
+        self._log_event("DAILY_WINDOW_ROTATED", {})
 
     def _load_slot_cache(self):
+        """槽切换时清空所有缓存和状态（避免跨槽污染）"""
         self._stats_cache = {
             "total_entries": 0,
             "by_behavior_dimension": {},
@@ -334,16 +392,21 @@ class PreferenceStatistics:
             "preference_keywords": [],
             "skip_count": 0,
         }
+        self._anomaly_cooldowns.clear()
+        self._log_event("SLOT_SWITCHED", {"new_slot_id": self._active_slot_id})
 
     def _report_status(self):
         if self.bus:
-            self.bus.publish_to_module("ag-mem-01", "internal_status", self.module_id, {
+            self.bus.publish_to_module("ag-mem-02", "internal_status", self.module_id, {
                 "total_entries": self._stats_cache.get("total_entries", 0),
                 "active_dimensions": len(self._stats_cache.get("by_behavior_dimension", {})),
+                "active_scenes": len(self._stats_cache.get("by_scene_label", {})),
             })
 
     def emergency_shutdown(self):
         self.state = StatisticsState.SYSTEM_PAUSED
+        self._stats_cache.clear()
+        self._anomaly_cooldowns.clear()
         self._log_event("SYSTEM_EVENT", {"sub_type": "emergency_shutdown"})
 
     def _log_event(self, event_type: str, details: Dict[str, Any]):
