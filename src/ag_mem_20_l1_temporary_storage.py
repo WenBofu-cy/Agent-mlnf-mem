@@ -120,6 +120,12 @@ class L1TemporaryStorage:
         data = msg.data
         source_slot = data.get("source_slot", msg.source_module)
 
+        # 源头校验：确保上游传入的数据包含核心字段
+        if not data.get("experience_data"):
+            self._reply_write_confirm(msg, "", 0, False, "缺少 experience_data 字段")
+            self._log_event("WRITE_REJECTED", {"reason": "missing experience_data", "source_slot": source_slot})
+            return
+
         # 提取经验数据
         entry = {
             "entry_id": f"L1-{int(time.time()*1000)}-{uuid.uuid4().hex[:8]}",
