@@ -23,7 +23,7 @@
   S-04: 本模块仅负责分槽调度与数据路由，不直接操作经验内容
   S-05: 维护扫描期间不得中断正常查询服务，写入请求排队不得超过 5 秒
 
-版本: V1.0 (查询超时修复版)
+版本: V1.0 (slot_result 路由修复版)
 """
 
 import time
@@ -155,6 +155,8 @@ class FunnelTwoDispatcher:
             self._handle_scene_judgment_result(msg)
         elif msg.topic == "ag-mem-03.slot_query_response":
             self._handle_slot_query_response(msg)
+        elif msg.topic == "ag-mem-03.slot_result":
+            self._handle_slot_result(msg)
 
     def _handle_init_check(self, msg: Message):
         if self.bus:
@@ -241,9 +243,22 @@ class FunnelTwoDispatcher:
         if len(entry["responses"]) >= entry["expected_count"]:
             self._merge_and_reply_query(corr_id)
 
+    def _handle_slot_result(self, msg: Message):
+        """
+        接收来自各场景分槽（ag-mem-15~19）的回执，转发给 ag-mem-01。
+        回执包括：写入确认、查询结果、维护结果等。
+        """
+        if self.bus:
+            self.bus.publish(
+                topic="ag-mem-01.slot_result",
+                source_module=self.module_id,
+                data=msg.data,
+                target_module="ag-mem-01",
+                correlation_id=msg.correlation_id
+            )
+
     def _check_pending_queries(self):
         now = time.time()
-        # 修复：直接调用合并回复，由其自行移除条目，避免重复移除导致回复丢失
         for corr_id in list(self._pending_queries.keys()):
             entry = self._pending_queries.get(corr_id)
             if entry and (now - entry["start_time"] > entry["timeout"]):
@@ -259,7 +274,6 @@ class FunnelTwoDispatcher:
             entry = self._pending_scene_requests.pop(corr_id, None)
             if entry:
                 req_msg = entry["req_msg"]
-                # 回退到通用任务槽
                 slot_id = SCENE_TO_SLOT_MAP[SceneCategory.GENERAL]
                 self._route_write_to_slot(slot_id, req_msg)
                 self._log_event("SCENE_JUDGMENT_TIMEOUT", {
