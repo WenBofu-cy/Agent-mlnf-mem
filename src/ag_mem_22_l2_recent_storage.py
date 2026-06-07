@@ -21,7 +21,7 @@
   S-03: 分槽查询时，L2仅返回与请求来源分槽匹配的条目，不得跨槽返回其他分槽的经验
   S-04: L2存储的持久化写入必须保证原子性，写入中断时不产生损坏的半条记录
 
-版本: V1.0
+版本: V1.0 (已修复ag-mem-23数据链路)
 """
 
 import time
@@ -69,10 +69,7 @@ class L2RecentStorage:
         print(f"[{self.module_id}] {self.module_name} {self.version} 初始化完成, "
               f"最大条目={self.MAX_ENTRIES}, 最大留存={self.MAX_RETENTION_HOURS}h")
 
-    # ====================== 统一主循环入口 ======================
-    def run_cycle(self):
-        self.l2_storage_main_loop()
-
+    # ====================== 主循环 ======================
     def l2_storage_main_loop(self):
         if self.state == StorageState.SYSTEM_PAUSED:
             return
@@ -213,6 +210,20 @@ class L2RecentStorage:
 
         self._recent_7d_queries += 1
 
+        # 向 ag-mem-23 推送命中条目列表
+        if self.bus and matched:
+            hit_entries = [
+                {"entry_id": e["entry_id"], "query_source_slot": source_slot}
+                for e in matched
+            ]
+            self.bus.publish_to_module(
+                target_module="ag-mem-23",
+                event_type="hit_entries",
+                source_module=self.module_id,
+                data={"hits": hit_entries}
+            )
+
+        # 返回查询结果给请求方
         if self.bus:
             self.bus.publish(
                 topic=f"{msg.source_module}.query_response",
