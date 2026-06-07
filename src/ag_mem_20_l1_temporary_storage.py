@@ -21,7 +21,7 @@
   S-03: L1容量紧急时强制清理不得删除最近500条经验，确保当前会话的经验不丢失
   S-04: L1存储的持久化写入必须保证原子性，写入中断时不产生损坏的半条记录
 
-版本: V1.0
+版本: V1.0 (修复衰减评估覆盖范围)
 """
 
 import time
@@ -45,7 +45,6 @@ class L1TemporaryStorage:
     version = "V1.0"
 
     # 容量配置
-    L1_CAPACITY_RATIO = 0.60
     MAX_ENTRIES = 10000
     MAX_ENTRY_SIZE_BYTES = 10 * 1024
     CAPACITY_WARN_THRESHOLD = 0.80
@@ -53,7 +52,9 @@ class L1TemporaryStorage:
     MIN_RETAIN_ENTRIES = 500
     DECAY_CHECK_INTERVAL_SEC = 6 * 3600
     STATUS_REPORT_INTERVAL_SEC = 30
-    DECAY_TRIGGER_RATIO = 0.20
+    # 正常/紧急情况下的最小滞留时间（小时）
+    NORMAL_RETENTION_HOURS = 24
+    EMERGENCY_RETENTION_HOURS = 6
 
     def __init__(self):
         self.bus: Optional[InternalBus] = None
@@ -70,10 +71,7 @@ class L1TemporaryStorage:
         print(f"[{self.module_id}] {self.module_name} {self.version} 初始化完成, "
               f"最大条目={self.MAX_ENTRIES}")
 
-    # ====================== 统一主循环入口 ======================
-    def run_cycle(self):
-        self.l1_storage_main_loop()
-
+    # ====================== 主循环 ======================
     def l1_storage_main_loop(self):
         if self.state == StorageState.SYSTEM_PAUSED:
             return
@@ -107,6 +105,10 @@ class L1TemporaryStorage:
         if msg.topic == "ag-mem-20.cleanup_confirm":
             cleaned = msg.data.get("cleaned_count", 0)
             self._entry_count -= cleaned
+            # 移除已清理的条目
+            removed_ids = set(msg.data.get("removed_entry_ids", []))
+            if removed_ids:
+                self._entries = [e for e in self._entries if e["entry_id"] not in removed_ids]
             # 更新状态
             usage_pct = self._calculate_usage_pct()
             if usage_pct < self.CAPACITY_WARN_THRESHOLD:
@@ -120,13 +122,37 @@ class L1TemporaryStorage:
         data = msg.data
         source_slot = data.get("source_slot", msg.source_module)
 
-        # 源头校验：确保上游传入的数据包含核心字段
         if not data.get("experience_data"):
             self._reply_write_confirm(msg, "", 0, False, "缺少 experience_data 字段")
             self._log_event("WRITE_REJECTED", {"reason": "missing experience_data", "source_slot": source_slot})
             return
 
-        # 提取经验数据
+        # 容量状态检查
+        usage_pct = self._calculate_usage_pct()
+        if usage_pct >= self.CAPACITY_CRITICAL_THRESHOLD:
+            self.state = StorageState.CAPACITY_CRITICAL
+        elif usage_pct >= self.CAPACITY_WARN_THRESHOLD:
+            self.state = StorageState.CAPACITY_WARNING
+
+        # 容量紧急处理：触发衰减，若仍无空间则拒绝
+        if self.state == StorageState.CAPACITY_CRITICAL and self._entry_count >= self.MAX_ENTRIES:
+            self._trigger_decay("容量紧急")
+            if self._entry_count >= self.MAX_ENTRIES:
+                self._reply_write_confirm(msg, "", 0, False, "L1容量已满且无法清理")
+                return
+
+        # 容量预警处理（温和清理）
+        if self.state == StorageState.CAPACITY_WARNING:
+            self._trigger_decay("容量预警")
+
+        # 校验条目大小
+        entry_size = len(str(data.get("experience_data", "")))
+        if entry_size > self.MAX_ENTRY_SIZE_BYTES:
+            self._reply_write_confirm(msg, "", 0, False,
+                                      f"条目大小超过{self.MAX_ENTRY_SIZE_BYTES}字节上限")
+            return
+
+        # 构建条目
         entry = {
             "entry_id": f"L1-{int(time.time()*1000)}-{uuid.uuid4().hex[:8]}",
             "source_slot_id": source_slot,
@@ -140,63 +166,47 @@ class L1TemporaryStorage:
             "timestamp": time.time()
         }
 
-        # 容量状态检查
-        usage_pct = self._calculate_usage_pct()
-        if usage_pct >= self.CAPACITY_CRITICAL_THRESHOLD:
-            self.state = StorageState.CAPACITY_CRITICAL
-        elif usage_pct >= self.CAPACITY_WARN_THRESHOLD:
-            self.state = StorageState.CAPACITY_WARNING
-
-        # 容量紧急处理
-        if self.state == StorageState.CAPACITY_CRITICAL and self._entry_count >= self.MAX_ENTRIES:
-            self._trigger_decay("容量紧急")
-            if self._entry_count >= self.MAX_ENTRIES:
-                self._reply_write_confirm(msg, "", 0, False, "L1容量已满且无法清理")
-                return
-
-        # 容量预警处理（温和清理）
-        if self.state == StorageState.CAPACITY_WARNING:
-            self._trigger_decay("容量预警")
-
-        # 校验条目大小
-        entry_size = len(str(entry["experience_data"]))
-        if entry_size > self.MAX_ENTRY_SIZE_BYTES:
-            self._reply_write_confirm(msg, "", 0, False,
-                                      f"条目大小超过{self.MAX_ENTRY_SIZE_BYTES}字节上限")
-            return
-
-        # 写入
         self._entries.append(entry)
         self._entry_count += 1
 
         # 更新分槽写入统计
-        if source_slot not in self._slot_write_stats:
-            self._slot_write_stats[source_slot] = 0
-        self._slot_write_stats[source_slot] += 1
+        self._slot_write_stats[source_slot] = self._slot_write_stats.get(source_slot, 0) + 1
 
         usage_pct = self._calculate_usage_pct()
         self._reply_write_confirm(msg, entry["entry_id"], usage_pct, True)
         self._log_event("EXPERIENCE_WRITTEN", {"entry_id": entry["entry_id"]})
 
     def _trigger_decay(self, reason: str):
-        """触发衰减评估"""
+        """筛选所有滞留超时的条目送入衰减评估，并强制保留最近500条"""
         if self._entry_count == 0 or not self.bus:
             return
 
-        # 按写入时间排序，取最旧的条目（保留最近500条）
-        sorted_entries = sorted(self._entries, key=lambda e: e.get("timestamp", 0))
-        # 不能超过 MIN_RETAIN_ENTRIES
-        max_clean = max(0, self._entry_count - self.MIN_RETAIN_ENTRIES)
-        decay_count = min(max_clean, max(1, int(self._entry_count * self.DECAY_TRIGGER_RATIO)))
-        decay_entries = sorted_entries[:decay_count]
+        now = time.time()
+        # 根据原因选择滞留时长阈值
+        min_retention_hours = self.EMERGENCY_RETENTION_HOURS if reason == "容量紧急" else self.NORMAL_RETENTION_HOURS
+        min_retention_seconds = min_retention_hours * 3600
 
-        if decay_entries:
+        # 筛选滞留时间超过阈值的条目
+        overdue_entries = [
+            e for e in self._entries
+            if now - e.get("timestamp", 0) >= min_retention_seconds
+        ]
+        if not overdue_entries:
+            return
+
+        # 保护最近500条不被清理
+        if self._entry_count > self.MIN_RETAIN_ENTRIES:
+            sorted_entries = sorted(self._entries, key=lambda e: e.get("timestamp", 0))
+            latest_ids = {e["entry_id"] for e in sorted_entries[-self.MIN_RETAIN_ENTRIES:]}
+            overdue_entries = [e for e in overdue_entries if e["entry_id"] not in latest_ids]
+
+        if overdue_entries:
             self.bus.publish_to_module(
                 target_module="ag-mem-21",
                 event_type="decay_assessment",
                 source_module=self.module_id,
                 data={
-                    "entries": decay_entries,
+                    "entries": overdue_entries,
                     "trigger_reason": reason,
                     "l1_usage_pct": self._calculate_usage_pct()
                 }
