@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 MemoryBus 全局记忆总线 + InternalBus 内部调度总线
-Agent-mlnf-mem 模块间通信中枢
+适用于 Agent-mlnf-mem（51 模块）与 Agent-ecc-brain（12 模块）双项目
 
 版本：V1.0
 原创提出者：文波福
@@ -10,13 +10,16 @@ Agent-mlnf-mem 模块间通信中枢
 
 修改记录：
 - V1.0: 首次正式发布，包含双总线架构、同步请求、优先级、TTL等
-- V1.1.1: 修复模块注册默认值问题
-- V1.1.1: 改用 PriorityQueue 实现优先级排序
-- V1.1.1: 恢复日志收集机制，对接 ag-mem-51
 - V1.1: 修复点对点消息重复投递 BUG
 - V1.1: 统一回调接口为 Message 对象
 - V1.1: 增加模块注册与校验机制
 - V1.1: 增加 priority / correlation_id 字段
+- V1.2: 增加 publish_reply 用于同步请求响应，支持消息 TTL 超时丢弃
+- V1.2: 增加消息队列防溢出机制
+- V1.2: 增加日志收集机制，对接 ag-mem-51
+- V1.3: 修复模块注册默认值问题
+- V1.3: 改用 PriorityQueue 实现优先级排序
+- V1.3: 模块 ID 正则兼容 ag-mcc-NN 格式
 """
 
 from typing import Dict, List, Callable, Any, Optional
@@ -47,8 +50,8 @@ PRIORITY_ORDER = {
 MSG_ID_PREFIX = "MSG"
 CORRELATION_PREFIX = "REQ"
 
-# 模块 ID 格式校验正则
-MODULE_ID_PATTERN = re.compile(r"^ag-(mem|ecc)-\d{2}$")
+# 模块 ID 格式校验正则（兼容 ag-mem-NN, ag-ecc-NN, ag-mcc-NN）
+MODULE_ID_PATTERN = re.compile(r"^ag-(mem|ecc|mcc)-\d{2}$")
 
 # 默认消息 TTL（秒），超时未处理自动丢弃
 DEFAULT_MSG_TTL = 30.0
@@ -74,7 +77,7 @@ class Message:
 
 class InternalBus:
     """
-    内部调度总线（MLNF 内部 51 个模块专用）
+    内部调度总线（MLNF 内部 51 个模块专用 / ECC 内部 12 个模块专用）
     
     特性：
     - 支持优先级投递（CRITICAL > HIGH > NORMAL > LOW）
@@ -82,22 +85,6 @@ class InternalBus:
     - 支持消息 TTL 超时丢弃
     - 支持模块注册校验
     - 异常处理器日志收集（对接 ag-mem-51）
-    
-    使用方式：
-        bus = InternalBus(validate_modules=True)
-        bus.register_module("ag-mem-01")
-        bus.register_module("ag-mem-02")
-        
-        def handler(msg: Message):
-            ...
-        bus.subscribe("ag-mem-01.experience_query", handler)
-        bus.subscribe_to_module("ag-mem-02", handler)
-        
-        # 异步发布
-        bus.publish("ag-mem-02.slot_query", "ag-mem-01", data={...})
-        
-        # 同步请求（等待响应）
-        response = bus.request("ag-mem-02.slot_query", "ag-mem-01", data={...}, timeout_ms=2000)
     """
 
     def __init__(self, validate_modules: bool = False):
@@ -108,13 +95,11 @@ class InternalBus:
         self._validate_modules = validate_modules
         self._registered_modules: set = set()
         self._pending_logs: List[Dict[str, Any]] = []
-        # 同步请求等待表：correlation_id → threading.Event
         self._pending_requests: Dict[str, threading.Event] = {}
         self._pending_responses: Dict[str, Message] = {}
 
     # ====================== 模块注册 ======================
     def register_module(self, module_id: str):
-        """注册模块 ID，自动校验格式"""
         if not MODULE_ID_PATTERN.match(module_id):
             raise ValueError(f"模块 ID 格式非法: {module_id}，必须为 ag-mem-NN 或 ag-ecc-NN")
         with self._lock:
@@ -144,7 +129,6 @@ class InternalBus:
         correlation_id: str = "",
         ttl: float = DEFAULT_MSG_TTL
     ):
-        """异步发布消息"""
         if not topic or not source_module:
             raise ValueError("topic 和 source_module 不能为空")
         if self._validate_modules:
@@ -173,12 +157,13 @@ class InternalBus:
         source_module: str,
         data: Any = None,
         priority: str = PRIORITY_NORMAL,
+        correlation_id: str = "",
         ttl: float = DEFAULT_MSG_TTL
     ):
-        """点对点异步发布"""
         topic = f"{target_module}.{event_type}"
         self.publish(topic=topic, source_module=source_module, data=data,
-                     target_module=target_module, priority=priority, ttl=ttl)
+                     target_module=target_module, priority=priority,
+                     correlation_id=correlation_id, ttl=ttl)
 
     # ====================== 同步请求 ======================
     def request(
@@ -190,30 +175,12 @@ class InternalBus:
         timeout_ms: float = 2000.0,
         priority: str = PRIORITY_NORMAL
     ) -> Optional[Message]:
-        """
-        同步请求-响应
-        
-        发送请求后阻塞等待，直到收到携带相同 correlation_id 的响应或超时。
-        响应方需调用 publish_reply() 发送响应消息。
-        
-        Args:
-            topic: 消息主题
-            source_module: 请求方模块 ID
-            data: 请求数据
-            target_module: 目标模块 ID
-            timeout_ms: 超时时间（毫秒）
-            priority: 优先级
-            
-        Returns:
-            响应 Message，超时返回 None
-        """
         correlation_id = f"{CORRELATION_PREFIX}-{uuid.uuid4().hex[:8]}"
         event = threading.Event()
 
         with self._lock:
             self._pending_requests[correlation_id] = event
 
-        # 发送请求
         self.publish(
             topic=topic,
             source_module=source_module,
@@ -223,14 +190,12 @@ class InternalBus:
             correlation_id=correlation_id,
         )
 
-        # 等待响应
         if event.wait(timeout=timeout_ms / 1000.0):
             with self._lock:
                 response = self._pending_responses.pop(correlation_id, None)
                 self._pending_requests.pop(correlation_id, None)
             return response
         else:
-            # 超时清理
             with self._lock:
                 self._pending_requests.pop(correlation_id, None)
                 self._pending_responses.pop(correlation_id, None)
@@ -245,12 +210,6 @@ class InternalBus:
         target_module: str = "",
         priority: str = PRIORITY_NORMAL
     ):
-        """
-        发送同步请求的响应
-        
-        模块在处理完同步请求后调用此方法发送响应。
-        correlation_id 必须与原始请求一致。
-        """
         msg = Message(
             message_id=f"{MSG_ID_PREFIX}-{uuid.uuid4().hex[:12]}",
             topic=topic,
@@ -265,28 +224,23 @@ class InternalBus:
             if correlation_id in self._pending_requests:
                 self._pending_responses[correlation_id] = msg
                 self._pending_requests[correlation_id].set()
-            # 如果原始请求方已经超时，响应消息不会入队，直接丢弃
 
     # ====================== 消息处理 ======================
     def process_one(self) -> int:
-        """处理队列中的下一条消息（按优先级）"""
         try:
             priority_num, timestamp, msg = self._message_queue.get(timeout=0)
         except Empty:
             return 0
 
-        # 丢弃过期消息
         if msg.is_expired():
             return 1
 
-        # 点对点消息：只投递模块订阅
         if msg.target_module:
             handlers = self._module_subscriptions.get(msg.target_module, [])
             for handler in handlers:
                 self._deliver(handler, msg)
             return 1
 
-        # 广播消息：投递 topic 订阅
         handlers = self._subscriptions.get(msg.topic, [])
         for handler in handlers:
             self._deliver(handler, msg)
@@ -326,7 +280,6 @@ class InternalBus:
             total += 1
         return total
 
-    # ====================== 查询与工具 ======================
     def pending_count(self) -> int:
         return self._message_queue.qsize()
 
@@ -358,12 +311,18 @@ class MemoryBus:
         self._validate_modules = validate_modules
         self._registered_modules: set = set()
         self._pending_logs: List[Dict[str, Any]] = []
+        self._pending_requests: Dict[str, threading.Event] = {}
+        self._pending_responses: Dict[str, Message] = {}
 
     def register_module(self, module_id: str):
         if not MODULE_ID_PATTERN.match(module_id):
             raise ValueError(f"模块 ID 格式非法: {module_id}，必须为 ag-mem-NN 或 ag-ecc-NN")
         with self._lock:
             self._registered_modules.add(module_id)
+
+    def is_module_registered(self, module_id: str) -> bool:
+        with self._lock:
+            return module_id in self._registered_modules
 
     def subscribe(self, topic: str, handler: Callable[[Message], None]):
         with self._lock:
@@ -411,15 +370,72 @@ class MemoryBus:
         source_module: str,
         data: Any = None,
         priority: str = PRIORITY_NORMAL,
+        correlation_id: str = "",
         ttl: float = DEFAULT_MSG_TTL
     ):
         topic = f"{target_module}.{event_type}"
         self.publish(topic=topic, source_module=source_module, data=data,
-                     target_module=target_module, priority=priority, ttl=ttl)
+                     target_module=target_module, priority=priority,
+                     correlation_id=correlation_id, ttl=ttl)
 
-    def is_module_registered(self, module_id: str) -> bool:
+    def request(
+        self,
+        topic: str,
+        source_module: str,
+        data: Any = None,
+        target_module: str = "",
+        timeout_ms: float = 2000.0,
+        priority: str = PRIORITY_NORMAL
+    ) -> Optional[Message]:
+        correlation_id = f"{CORRELATION_PREFIX}-{uuid.uuid4().hex[:8]}"
+        event = threading.Event()
+
         with self._lock:
-            return module_id in self._registered_modules
+            self._pending_requests[correlation_id] = event
+
+        self.publish(
+            topic=topic,
+            source_module=source_module,
+            data=data,
+            target_module=target_module,
+            priority=priority,
+            correlation_id=correlation_id,
+        )
+
+        if event.wait(timeout=timeout_ms / 1000.0):
+            with self._lock:
+                response = self._pending_responses.pop(correlation_id, None)
+                self._pending_requests.pop(correlation_id, None)
+            return response
+        else:
+            with self._lock:
+                self._pending_requests.pop(correlation_id, None)
+                self._pending_responses.pop(correlation_id, None)
+            return None
+
+    def publish_reply(
+        self,
+        topic: str,
+        source_module: str,
+        data: Any,
+        correlation_id: str,
+        target_module: str = "",
+        priority: str = PRIORITY_NORMAL
+    ):
+        msg = Message(
+            message_id=f"{MSG_ID_PREFIX}-{uuid.uuid4().hex[:12]}",
+            topic=topic,
+            source_module=source_module,
+            target_module=target_module,
+            data=data,
+            priority=priority,
+            correlation_id=correlation_id,
+        )
+
+        with self._lock:
+            if correlation_id in self._pending_requests:
+                self._pending_responses[correlation_id] = msg
+                self._pending_requests[correlation_id].set()
 
     def process_one(self) -> int:
         try:
@@ -484,36 +500,32 @@ def demo_main():
     print("  MemoryBus + InternalBus 双总线 V1.0 演示")
     print("=" * 60)
 
-    # 内部总线（模块间）
     internal = InternalBus()
-    internal.register_module("ag-mem-01")
-    internal.register_module("ag-mem-02")
+    internal.register_module("ag-ecc-01")
+    internal.register_module("ag-ecc-02")
 
-    # 外部总线（ECC ↔ MLNF）
     external = MemoryBus()
+    external.register_module("ag-ecc-01")
     external.register_module("ag-mem-01")
-    external.register_module("ag-ecc-05")
 
-    # 演示同步请求
     def sync_handler(msg: Message):
-        print(f"  [同步] ag-mem-02 收到: {msg.topic}, data={msg.data}")
-        # 模拟处理并返回响应
+        print(f"  [同步] ag-ecc-02 收到: {msg.topic}, data={msg.data}")
         internal.publish_reply(
-            topic="ag-mem-02.response",
-            source_module="ag-mem-02",
-            data={"status": "ok", "slot_id": "SLOT-LONG-1"},
+            topic="ag-ecc-02.response",
+            source_module="ag-ecc-02",
+            data={"status": "ok", "result": 42},
             correlation_id=msg.correlation_id,
             target_module=msg.source_module,
         )
 
-    internal.subscribe_to_module("ag-mem-02", sync_handler)
+    internal.subscribe_to_module("ag-ecc-02", sync_handler)
 
     print("\n  发起同步请求...")
     response = internal.request(
-        topic="ag-mem-02.slot_query",
-        source_module="ag-mem-01",
+        topic="ag-ecc-02.query",
+        source_module="ag-ecc-01",
         data={"user_id": "U001"},
-        target_module="ag-mem-02",
+        target_module="ag-ecc-02",
         timeout_ms=2000,
     )
     if response:
@@ -521,10 +533,9 @@ def demo_main():
     else:
         print("  请求超时")
 
-    # 处理外部消息
     received = []
-    external.subscribe("ag-mem-01.experience_query", lambda msg: received.append(msg))
-    external.publish("ag-mem-01.experience_query", "ag-ecc-05", {"query_type": "experience"})
+    external.subscribe("ag-ecc-01.test", lambda msg: received.append(msg))
+    external.publish("ag-ecc-01.test", "ag-mem-01", {"query": "test"})
     external.process_all()
     print(f"\n  外部总线处理: {len(received)} 条消息")
 
@@ -579,7 +590,7 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"   ❌ FAIL: {e}"); failed += 1
 
-        # TC-04: 优先级投递（CRITICAL 优先）
+        # TC-04: 优先级投递
         print("\n[TC-04] CRITICAL 优先级优先投递")
         try:
             bus = InternalBus()
@@ -624,7 +635,7 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"   ❌ FAIL: {e}"); failed += 1
 
-        # TC-07: 双总线隔离（InternalBus 消息不投递到 MemoryBus）
+        # TC-07: 双总线隔离
         print("\n[TC-07] 双总线隔离")
         try:
             internal = InternalBus()
