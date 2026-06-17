@@ -418,4 +418,3 @@ class F0GlobalDispatch:
 
     def get_state(self):
         return self.state
-```
