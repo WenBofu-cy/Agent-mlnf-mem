@@ -1,240 +1,254 @@
-# ag-mem-03-漏斗二专属调度单元 接口规格
-
----
-
+# ag-mem-03 漏斗二调度单元 完整标准化接口文档（对齐EM-Core-Agent V1.1白皮书任务经验漏斗业务调度中枢）
 ## 基本信息
-
 | 项 | 内容 |
 |----|------|
 | 模块编号 | ag-mem-03 |
-| 模块名称 | 漏斗二专属调度单元 |
-| 所属分区 | 一、顶层总控中枢 |
-| 核心职责 | 作为漏斗二（任务经验漏斗）的专属调度单元，负责任务经验分槽的全生命周期管理。接收 ag-mem-01 转发的任务经验查询与写入请求，依据任务场景标签判定目标分槽，管理对话交互槽、工具调用槽、信息检索槽、创作生成槽、通用任务槽五类分槽的激活与休眠。确保不同分槽之间的经验条目物理隔离，管理各分槽独立的晋升阈值与遗忘策略参数。不参与任何认知决策，仅执行漏斗二内部资源的调度与路由 |
-| 依赖模块 | ag-mem-01（总控漏斗F0，接收调度指令）、ag-mem-14（任务场景判定与分槽路由单元，提供场景分类结果）、ag-mem-48（全局容量配额管控单元，查询漏斗二存储配额） |
-| 被依赖模块 | ag-mem-01（返回查询/写入结果）、ag-mem-15~19（五个场景分槽，接收激活信号与经验路由）、ag-mem-20~43（五层存储与重要度引擎，接收经验数据流） |
-
+| 模块名称 | 漏斗二调度单元 |
+| 所属分区 | 三、漏斗二：任务经验漏斗 业务调度中枢（串联前置分槽组+五层记忆存储全链路） |
+| 核心职责 | 承接ag-mem-01总控F0全局调度指令，统筹漏斗二全链路业务流程；统一接收ag-mem15~19前置分槽大盘统计、冷热/负载/生命周期告警、ag-mem20~30各分层存储运行指标；驱动分层记忆定时晋升、归档扫描、I值刷新、遗忘淘汰批量任务；接收运维人工记忆操作指令（人工归档、冻结、分槽清理）并分发至对应执行模块；汇总全漏斗业务指标、资源风险报表供给运维面板；定时上报自身调度内存开销至ag-mem-48；所有批量任务启停、人工运维操作、链路风险告警全量写入ag-mem-51审计日志；仅做流程调度与任务分发，无原始记忆读写、无向量计算、无持久存储能力。 |
+| 依赖模块 | ag-mem-01（总控F0全局熔断调度，接收全局PAUSE/RESUME/FUSE指令、全局熔断统计大盘）、ag-mem-35（三维权重配置单元，读取分层晋升周期、归档扫描频率、批量任务分片上限、遗忘策略参数）、ag-mem-48（全局容量配额管控，上报调度缓存内存占用）、前置分槽组ag-mem15/16/17/18/19（接收分槽负载、冷热、生命周期、全局汇总报表）、五层存储配套单元ag-mem20~30（读取分层容量、条目存量、运行状态）、ag-mem37/40/42/45（接收I刷新、遗忘扫描、冗余删除、安全校验运行统计） |
+| 被依赖模块 | ag-mem15~19（下发分槽资源优化处置提示）、ag-mem20~30（下发分层晋升、归档扫描、人工归档/冻结任务指令）、ag-mem37（下发全局I值批量刷新调度信号）、ag-mem40（下发全分层遗忘扫描调度信号）、ag-mem42（下发批量冗余记忆清理调度信号）、运维面板（输出漏斗二全链路业务大盘、资源风险告警）、ag-mem48（接收调度缓存内存定时上报）、ag-mem-51（记录全漏斗任务调度、人工操作审计日志） |
 
 ## 内部状态定义
-
 | 状态 | 标识 | 含义 | 触发条件 |
 |------|------|------|----------|
-| 空闲等待 | `IDLE` | 无调度任务，等待指令 | 系统初始化完成，无待处理请求 |
-| 场景判定 | `SCENE_JUDGE` | 正在判定任务场景类别，确定目标分槽 | 收到 ag-mem-01 的经验查询或写入请求 |
-| 分槽创建 | `SLOT_CREATING` | 为目标场景创建新的经验分槽 | 目标场景无可用分槽且需要创建 |
-| 数据路由 | `ROUTING` | 将经验数据路由至目标分槽 | 目标分槽已激活 |
-| 维护扫描 | `MAINT_SCAN` | 执行分槽健康检查与闲置回收 | 定时触发或收到维护指令 |
-| 暂停服务 | `SYSTEM_PAUSED` | 系统紧急熔断 | 收到紧急熔断指令 |
-
+| 业务调度待机就绪 | `FUNNEL_IDLE` | 无批量调度任务，等待定时周期或人工指令，全链路正常运行 | 系统初始化完成、熔断恢复、上一轮批量任务全部执行完毕 |
+| 链路指标采集缓存 | `METRIC_FETCH` | 同步拉取前置分槽、五层存储、配套辅助单元全量运行指标存入本地缓存 | 定时调度周期倒计时归零 |
+| 批量任务生成计算 | `TASK_GEN_CALC` | 根据指标与配置生成晋升、归档、I刷新、遗忘清理、分槽优化多类批量任务清单 | 全链路指标采集完成 |
+| 任务批量分发执行 | `TASK_DISPATCH` | 分片下发各类调度任务至对应业务模块，同步推送资源风险告警至运维面板 | 全部批量任务计算生成完毕 |
+| 调度暂停降级 | `FUNNEL_PAUSE` | 收到ag-mem-01下发PAUSE指令，暂停所有非核心定时批量任务，仅保留指标采集与日志上报 | F0下发半熔断PAUSE指令；RESUME切回FUNNEL_IDLE |
+| 调度完全冻结 | `FUNNEL_FUSE` | 收到ag-mem-01下发FUSE全熔断指令，停止所有指标拉取、任务生成、任务分发 | F0下发全熔断FUSE指令；RESUME恢复待机 |
 
 ## 输入数据
-
 | 输入项 | 数据类型 | 来源模块 | 触发条件 | 优先级 |
 |--------|----------|----------|----------|:---:|
-| 任务经验操作请求 | Struct（操作类型：查询/写入 + 任务场景标签 + 经验条目数据 + 用户ID + 重要度预估值） | ag-mem-01 总控漏斗F0（通过内部调度总线） | ECC 发起任务经验查询或漏斗二经验写入时 | **高** |
-| 任务场景判定结果 | Struct（场景类别 + 匹配置信度 + 建议目标分槽编号） | ag-mem-14 任务场景判定与分槽路由单元 | 场景判定完成时 | **高** |
-| 分槽创建完成回执 | Struct（分槽编号 + 存储分区指针 + 初始化状态 + 关联场景类别） | ag-mem-15~19 对应场景分槽 | 新分槽创建完成时 | **高** |
-| 漏斗二存储配额信息 | Struct（总配额 + 已用容量 + 各分槽使用率 + 可用空间） | ag-mem-48 全局容量配额管控单元 | 查询请求时或周期性 | 普通 |
-| 全局调度指令 | Enum（暂停/恢复/熔断/维护扫描） | ag-mem-01 总控漏斗F0 | 模式切换或紧急事件时 | **紧急** |
-
+| F0全局调度控制指令 | Enum（PAUSE/RESUME/FUSE）、全局熔断统计报表 | ag-mem-01 总控F0全局熔断调度 | 全局熔断等级切换、定时全局统计上报 | 紧急 |
+| 前置分槽全套指标报表 | 分槽负载告警、冷热预警、闲置分槽回收提示、全局分槽汇总大盘 | ag-mem15/16/17/18/19 | 各分槽辅助单元180s周期统计上报 | 高 |
+| 五层存储分层运行指标 | L0~L5容量占用、条目总量、归档进度、写入吞吐量统计 | ag-mem20~30 | 各存储层180s周期运行统计上报 | 高 |
+| 辅助计算单元运行统计 | I值刷新进度、遗忘扫描进度、冗余删除执行量、安全校验拦截统计 | ag-mem37/40/42/45 | 配套单元周期统计上报 | 高 |
+| 漏斗二调度业务配置回执 | Struct（分层晋升周期、归档扫描间隔、单任务最大分片数量、遗忘批量上限、分槽风险处置阈值） | ag-mem-35 三维权重配置单元 | 模块初始化、调度策略运维更新 | 普通 |
+| 运维人工记忆操作指令 | Struct（操作类型：批量晋升/人工归档/分槽清理/顶层条目冻结、目标funnel/abs_id清单、执行优先级） | 运维后台面板 | 人工发起记忆批量运维操作 | 高 |
+| 漏斗调度状态批量查询请求 | Struct（指定模块/全漏斗链路指标导出） | 运维面板、各记忆业务模块 | 运维查看业务大盘、模块读取调度全局任务状态 | 普通 |
 
 ## 输出数据
-
 | 输出项 | 数据类型 | 目标模块 | 输出条件 | 优先级 |
 |--------|----------|----------|----------|:---:|
-| 任务经验查询结果 | Struct（匹配经验列表 + 来源分槽 + 各槽置信度 + 查询耗时） | ag-mem-01 总控漏斗F0（通过内部调度总线） | 查询完成时 | **高** |
-| 任务经验写入确认 | Struct（写入状态 + 分配分槽 + 分配层级 + 预估晋升时间） | ag-mem-01 总控漏斗F0（通过内部调度总线） | 写入完成时 | **高** |
-| 场景判定请求 | Struct（任务描述 + 上下文特征 + 用户ID） | ag-mem-14 任务场景判定与分槽路由单元 | 收到新任务经验请求时 | **高** |
-| 新分槽创建指令 | Struct（场景类别 + 初始存储配额 + 遗忘策略参数） | ag-mem-15~19 对应场景分槽 | 判定需要创建新分槽时 | **高** |
-| 分槽激活信号 | Struct（分槽编号 + 场景类别 + 活跃状态 + 晋升阈值配置） | ag-mem-15~19（场景分槽）、ag-mem-20（L1存储） | 分槽匹配或创建成功后 | **高** |
-| 维护扫描指令 | Struct（扫描范围 + 扫描类型） | ag-mem-25（归并单元）、ag-mem-40（遗忘判定） | 定时触发维护时 | 普通 |
-| 分槽状态上报 | Struct（活跃分槽列表 + 各分槽使用率 + 经验条目数 + 最近活跃时间） | ag-mem-01 总控漏斗F0 | 周期性（每5秒）或状态变更时 | 普通 |
+| 分层记忆批量晋升调度指令 | List<Struct>（目标分层、分片数量、扫描范围、执行优先级） | ag-mem20~28 | 到达分层晋升定时周期，分槽/分层存量达到晋升阈值 | 高 |
+| 分层归档扫描调度指令 | List<Struct>（funnel范围、归档倍率、冷数据优先标记） | ag-mem26、ag-mem28 | 分层容量预警、长期冷条目占比超标 | 高 |
+| 全局I值刷新/遗忘扫描调度信号 | Struct（全量/分funnel局部扫描、批量处理上限） | ag-mem37、ag-mem40 | 到达定时权重刷新周期、分槽冷热指标大幅变动 | 高 |
+| 冗余记忆批量清理调度信号 | Struct（分层范围、待清理条目预估数量） | ag-mem42 | 遗忘扫描输出大量淘汰候选条目 | 普通 |
+| 分槽资源优化处置提示 | Struct（冷分槽限流、闲置分槽清理建议） | ag-mem15 | 接收ag-mem16/17/18分槽风险告警 | 普通 |
+| 漏斗二全链路业务大盘&风险告警报表 | Struct（分层条目总量、容量占用、待晋升/待归档数量、高风险分槽清单、调度任务执行统计） | 运维告警面板 | 每一轮指标采集与任务分发完成 | 普通 |
+| 调度缓存内存占用上报 | Struct（单元标识ag-mem-03、任务缓存KB、指标缓存KB、待执行任务总量） | ag-mem-48 全局容量配额 | 每60秒定时上报、大批量任务分发后即时上报 | 普通 |
+| 漏斗调度审计日志 | Struct（事件类型、调度任务类型、分片执行数量、人工操作账号、受影响funnel/分层、时间戳） | ag-mem-51 记忆变更日志追溯单元 | 批量任务下发、人工运维操作、风险告警推送完成 | 普通 |
+| 漏斗周期运行统计上报 | Struct（当前调度状态、今日晋升总批次、归档扫描总次数、人工运维操作总量、高风险资源分组数量） | ag-mem-01 总控F0 | 每180秒周期性上报漏斗业务大盘给全局调度底座 | 普通 |
 
+## 漏斗二调度核心规则（V1.1任务经验漏斗全链路调度规范）
+### 1. 全局调度配置参数（ag-mem-35统一分发）
+1. L0→L1晋升周期：60s；L1→L2：300s；L2→L3：900s；L3→L4：1800s；L4→L5抽象提炼周期：3600s
+2. 分层归档扫描基础间隔：3600s，容量预警自动倍率提升至2~5倍；
+3. 单批次调度任务分片上限：1000条，超量自动拆分串行下发；
+4. 全局I值重算周期：7200s；全分层遗忘扫描周期：14400s；
+5. 高风险分槽判定复用ag-mem-19聚合统计风险阈值。
 
-## 任务场景分槽路由策略
+### 2. 多类型调度任务触发条件
+1. 分层晋升任务：到达定时周期 + 当前分层条目存量超过晋升触发阈值；
+2. 分层归档扫描：分层容量占用≥80%预警阈值 或 冷分槽占比≥70%；
+3. I值刷新任务：到达定时刷新周期、新增大量顶层抽象单元、分槽冷热负载指标大幅变动；
+4. 遗忘淘汰任务：定时全链路扫描、分层容量紧急溢出、运维手动发起清理；
+5. 分槽优化提示：接收冷热/负载/生命周期高风险告警，推送资源优化建议至ag-mem-15。
 
-| 场景类别 | 目标分槽 | 分槽编号 | 权重调整 | 遗忘保护 |
-|----------|:---:|:---:|------|:---:|
-| 对话交互类任务 | 对话交互槽 | ag-mem-15 | V值权重上调20% | 标准 |
-| 工具调用类任务 | 工具调用槽 | ag-mem-16 | S值权重上调20% | 标准 |
-| 信息检索类任务 | 信息检索槽 | ag-mem-17 | C值权重上调10% | 轻度保护 |
-| 创作生成类任务 | 创作生成槽 | ag-mem-18 | 标准权重 | 标准 |
-| 混合/未分类任务 | 通用任务槽 | ag-mem-19 | 标准权重 | 强保护 |
+### 3. 熔断下任务降级规则
+1. FUNNEL_PAUSE（半熔断PAUSE）：暂停定时晋升、归档、遗忘扫描，仅保留指标采集、人工紧急归档、日志上报；
+2. FUNNEL_FUSE（全熔断FUSE）：停止全部指标拉取、任务生成、任务下发，仅维持心跳与审计日志写入。
 
-**路由优先级**：当一条经验匹配多个场景时，按置信度最高的场景路由；若多个场景置信度接近（差值<0.1），同时写入匹配的场景分槽并标记为关联经验。
+### 4. 流转强制约束
+1. 仅接收ag-mem-01全局调度指令，所有业务任务调度不可绕过F0全局熔断管控；
+2. 无任何记忆条目读写、向量蒸馏、持久存储能力，仅做任务分发与指标聚合；
+3. 单向任务分发：仅向对应业务模块下发调度指令，不直接修改分层存储/分槽元数据；
+4. 全链路闭环：串联前置分槽→五层存储→配套计算单元，统一汇总所有业务指标对外输出大盘。
 
+### 5. 批量约束
+单类调度任务单次最大分片1000条，超量自动拆分多轮下发，避免单模块瞬时IO/算力冲击。
 
 ## 核心处理逻辑
-
 ```
-FUNCTION funnel_two_dispatcher_main_loop():
-    STATE_IDLE = IDLE
-    STATE_JUDGE = SCENE_JUDGE
-    STATE_CREATE = SLOT_CREATING
-    STATE_ROUTE = ROUTING
-    STATE_MAINT = MAINT_SCAN
-    STATE_PAUSED = SYSTEM_PAUSED
+FUNCTION funnel_two_scheduler_main_loop():
+    STATE_IDLE = FUNNEL_IDLE
+    STATE_FETCH = METRIC_FETCH
+    STATE_GEN = TASK_GEN_CALC
+    STATE_DISPATCH = TASK_DISPATCH
+    STATE_PAUSE = FUNNEL_PAUSE
+    STATE_FUSE = FUNNEL_FUSE
 
-    SET internal_state = STATE_IDLE
-    初始化分槽映射表（场景类别 → 分槽编号列表）
-    初始化分槽激活状态表
-    初始化分槽计数器（按场景类别统计）
+    internal_state = STATE_IDLE
+    // 加载漏斗调度全局配置
+    schedule_cfg = query_funnel_schedule_config(from_m35="ag-mem-35")
+    max_task_slice = schedule_cfg.max_batch_task
+    promote_cycle_map = schedule_cfg.layer_promote_cycle
+    archive_base_cycle = schedule_cfg.archive_scan_interval
+    refresh_I_cycle = schedule_cfg.global_I_refresh_cycle
+    forget_scan_cycle = schedule_cfg.full_forget_cycle
 
-    WHILE 系统运行中:
-        // 第1步：紧急熔断
-        IF 收到紧急熔断指令:
-            SET internal_state = STATE_PAUSED
+    metric_cache = {}
+    pending_task_list = []
+    stat_promote_batch = 0
+    stat_archive_scan = 0
+    stat_manual_op = 0
+    last_metric_scan_ts = NOW()
+    last_cap_report_ts = NOW()
+
+    WHILE 系统进程存活:
+        now_ts = NOW()
+        // 1. 最高优先级：处理F0全局熔断调度指令
+        IF 收到F0全局调度控制指令:
+            fuse_cmd = 获取全局指令
+            old_state = internal_state
+            if fuse_cmd == "FUSE":
+                internal_state = STATE_FUSE
+                metric_cache.clear()
+                pending_task_list.clear()
+                send_audit_log(target="ag-mem-51", log_data=build_schedule_state_audit(old_state, internal_state, "F0全局全熔断冻结调度", now_ts))
+                CONTINUE
+            elif fuse_cmd == "PAUSE":
+                internal_state = STATE_PAUSE
+                send_audit_log(target="ag-mem-51", log_data=build_schedule_state_audit(old_state, internal_state, "F0半熔断暂停批量任务", now_ts))
+            elif fuse_cmd == "RESUME":
+                internal_state = STATE_IDLE
+                send_audit_log(target="ag-mem-51", log_data=build_schedule_state_audit(old_state, internal_state, "F0恢复漏斗调度", now_ts))
+
+        // 全熔断状态直接跳过所有业务逻辑
+        IF internal_state == STATE_FUSE:
+            SLEEP 10ms
             CONTINUE
-        ELSE IF 收到恢复指令 AND internal_state == STATE_PAUSED:
-            SET internal_state = STATE_IDLE
 
-        // 第2步：收到维护扫描指令
-        IF 收到维护扫描指令 OR 距上次维护 > 24小时:
-            SET internal_state = STATE_MAINT
-            向 ag-mem-25 发送归并扫描指令
-            向 ag-mem-40 发送遗忘扫描指令
-            FOR EACH 分槽 IN 分槽激活状态表:
-                IF 分槽.最近活跃时间 > 30天:
-                    标记分槽为休眠
-                    回收闲置存储配额
-            SET internal_state = STATE_IDLE
-            CONTINUE
+        // 2. 接收并缓存全链路各类指标上报
+        IF 收到前置分槽/分层存储/辅助单元周期统计报表:
+            metric = 获取指标报表
+            metric_cache[metric.module_id] = metric
 
-        // 第3步：接收任务经验操作请求
-        IF 收到 ag-mem-01 转发请求:
-            请求 = 操作请求
-            操作类型 = 请求.操作类型
+        // 3. 接收运维人工记忆操作指令
+        IF 收到运维人工记忆操作指令:
+            manual_op = 获取人工操作参数
+            internal_state = STATE_GEN
+            manual_task = build_manual_schedule_task(op=manual_op, slice_limit=max_task_slice)
+            pending_task_list.append(manual_task)
+            stat_manual_op += 1
+            internal_state = STATE_DISPATCH
+            // 分片下发人工操作任务
+            slice_tasks = split_slice(pending_task_list, max_task_slice)
+            for slice in slice_tasks:
+                dispatch_task_batch(task_slice=slice)
+            send_audit_log(target="ag-mem-51", log_data=build_manual_op_audit(op=manual_op, ts=now_ts))
+            pending_task_list.clear()
+            internal_state = STATE_IDLE
 
-            // 3a. 场景判定
-            SET internal_state = STATE_JUDGE
-            向 ag-mem-14 发送场景判定请求(
-                任务描述=请求.任务描述,
-                上下文特征=请求.上下文,
-                用户ID=请求.用户ID
-            )
+        // 4. 定时全链路指标采集+自动批量任务生成（仅待机状态执行）
+        IF internal_state == STATE_IDLE and (now_ts - last_metric_scan_ts) >= schedule_cfg.metric_scan_interval:
+            internal_state = STATE_FETCH
+            // 主动拉取全链路完整指标补齐缓存
+            full_metric_set = fetch_all_funnel_metrics()
+            metric_cache.update(full_metric_set)
+            internal_state = STATE_GEN
+            // 自动生成各类定时调度任务
+            auto_task_batch = generate_all_schedule_tasks(metric_cache, schedule_cfg, now_ts)
+            pending_task_list.extend(auto_task_batch)
+            // 统计任务类型数量
+            for task in auto_task_batch:
+                if task.task_type == "layer_promote":
+                    stat_promote_batch += 1
+                elif task.task_type == "archive_scan":
+                    stat_archive_scan += 1
+            internal_state = STATE_DISPATCH
+            // 分片下发自动批量任务
+            slice_tasks = split_slice(pending_task_list, max_task_slice)
+            for slice in slice_tasks:
+                dispatch_task_batch(task_slice=slice)
+            // 组装全漏斗业务大盘与风险告警
+            funnel_overview = build_funnel_overview_report(metric_cache, schedule_cfg)
+            send_overview_report(target="运维告警面板", report=funnel_overview)
+            // 写入自动调度审计日志
+            audit_log = build_auto_schedule_audit(task_total=len(pending_task_list), ts=now_ts)
+            send_audit_log(target="ag-mem-51", log_data=audit_log)
+            pending_task_list.clear()
+            last_metric_scan_ts = now_ts
+            internal_state = STATE_IDLE
 
-            // 等待场景判定结果
-            判定结果 = 等待 ag-mem-14 返回()
-            场景类别 = 判定结果.场景类别
-            置信度 = 判定结果.匹配置信度
+        // 5. 响应漏斗调度状态批量查询请求
+        IF 收到漏斗调度状态批量查询请求:
+            query_param = 获取查询条件
+            state_snap = build_scheduler_full_snapshot(metric_cache, internal_state, pending_task_list)
+            send_snapshot(target_list=query_param.requester, snapshot_data=state_snap)
 
-            // 3b. 查询目标分槽
-            目标分槽列表 = 分槽映射表.查找(场景类别)
-
-            IF 目标分槽列表为空:
-                // 无可用分槽，创建新分槽
-                SET internal_state = STATE_CREATE
-                配额信息 = 向 ag-mem-48 查询漏斗二可用容量()
-                IF 配额信息.可用空间 < 新槽最小配额:
-                    向 ag-mem-01 返回错误(原因="漏斗二存储空间不足")
-                    SET internal_state = STATE_IDLE
-                    CONTINUE
-
-                向对应场景分槽发送新分槽创建指令(场景类别, 默认配额, 默认遗忘参数)
-                // 等待创建完成
-                创建回执 = 等待分槽返回()
-                分槽映射表.添加(场景类别, 创建回执.分槽编号)
-                目标分槽列表 = [创建回执.分槽编号]
-                SET internal_state = STATE_ROUTE
-            ELSE:
-                SET internal_state = STATE_ROUTE
-
-            // 3c. 数据路由
-            IF 操作类型 == "查询":
-                查询结果集 = []
-                FOR EACH 分槽编号 IN 目标分槽列表:
-                    向分槽编号发送经验查询请求(请求.查询条件)
-                    分槽结果 = 等待分槽返回()
-                    查询结果集.合并(分槽结果)
-                按重要度降序排列查询结果集
-                向 ag-mem-01 返回任务经验查询结果(查询结果集, 场景类别, 置信度)
-
-            ELSE IF 操作类型 == "写入":
-                写入成功数 = 0
-                FOR EACH 分槽编号 IN 目标分槽列表:
-                    向分槽编号发送经验写入请求(请求.经验条目数据)
-                    写入结果 = 等待分槽返回()
-                    IF 写入结果.成功:
-                        写入成功数++
-                向 ag-mem-01 返回任务经验写入确认(
-                    写入成功数=写入成功数,
-                    分配分槽列表=目标分槽列表,
-                    分配层级="L1（临时层）"
+        // 6. 60s定时内存上报 + 180s周期统计上报至ag-mem-01
+        IF now_ts - last_cap_report_ts >= 60 * 1000:
+            cache_kb = calc_schedule_cache_kb(metric_cache, pending_task_list, schedule_cfg.avg_metric_kb)
+            cap_report = build_cap_report(layer="ag-mem-03", used_kb=cache_kb, pending_task_count=len(pending_task_list))
+            send_cap_report(target="ag-mem-48", report=cap_report)
+            // 每180s向F0全局调度输出漏斗业务统计大盘
+            IF now_ts - last_cap_report_ts >= 180 * 1000:
+                stat_report = build_funnel_runtime_stat(
+                    state=internal_state,
+                    total_promote_batch=stat_promote_batch,
+                    total_archive_scan=stat_archive_scan,
+                    total_manual_op=stat_manual_op
                 )
+                send_stat_report(target="ag-mem-01", report=stat_report)
+            last_cap_report_ts = now_ts
 
-            SET internal_state = STATE_IDLE
-
-        // 第4步：周期性状态上报
-        IF 距上次状态上报 >= 5秒:
-            统计各分槽使用率、经验条目数、活跃状态
-            向 ag-mem-01 上报分槽状态
-
-        SLEEP 20ms
+        SLEEP 10ms
 ```
-
 
 ## 约束与异常处理
-
 | 场景 | 处理方式 | 恢复条件 |
 |------|----------|----------|
-| 场景判定置信度过低（<0.3） | 默认路由至通用任务槽（ag-mem-19），标记低置信度 | 后续同类任务积累经验后更新判定模型 |
-| 目标分槽创建超时 | 重试一次，仍失败则临时路由至通用任务槽，标记异常 | 目标分槽恢复正常 |
-| 漏斗二存储空间不足 | 触发低重要度清理，暂停写入直到清理完成 | 清理完成且有足够空间 |
-| 同一条经验匹配多个场景 | 置信度差值<0.1时同时写入多个分槽，标记关联ID | — |
-| 维护扫描期间收到查询请求 | 查询请求正常处理，写入请求排队等待 | 维护完成 |
-| 紧急熔断 | 暂停所有操作，保持分槽状态不变 | 紧急解除后恢复 |
-
+| 某业务模块指标上报缺失、字段不全 | 本轮自动任务跳过依赖该模块的调度逻辑，写入告警审计，等待下一周期完整指标 | 对应业务模块恢复正常周期统计上报 |
+| 单次生成调度任务总量超过1000分片上限 | 自动拆分多批次串行下发，控制单模块并发任务压力 | 内置分片逻辑自动执行 |
+| 目标模块接收调度任务无响应 | 记录任务下发失败告警，下一轮指标扫描重新生成补发任务 | 下游业务模块服务恢复正常接收指令 |
+| 调度指标缓存内存溢出 | 清理超过3轮周期的过期指标缓存，向ag-mem-48上报容量风险告警 | 扩容调度内存或缩短指标扫描周期 |
+| ag-mem-35调度配置拉取失败 | 加载内置通用晋升/归档周期兜底执行调度，输出配置缺失告警 | ag-mem-35恢复下发完整调度策略 |
+| 半熔断PAUSE状态下触发自动批量任务 | 直接丢弃自动任务，仅保留人工紧急运维任务可下发 | ag-mem-01下发RESUME恢复正常调度 |
 
 ## 总线契约
-
 | 总线 | 操作 | 数据内容 | 权限 | 说明 |
 |------|------|----------|------|------|
-| 内部调度总线 | 读 | 任务经验操作请求 | 只读 | ag-mem-01 转发 |
-| 内部调度总线 | 读 | 任务场景判定结果 | 只读 | ag-mem-14 返回 |
-| 内部调度总线 | 读 | 分槽创建完成回执 | 只读 | ag-mem-15~19 返回 |
-| 内部调度总线 | 读 | 漏斗二存储配额信息 | 只读 | ag-mem-48 返回 |
-| 内部调度总线 | 写 | 任务经验查询结果 | 专属写入 | 向 ag-mem-01 返回 |
-| 内部调度总线 | 写 | 任务经验写入确认 | 专属写入 | 向 ag-mem-01 返回 |
-| 内部调度总线 | 写 | 场景判定请求 | 专属写入 | 向 ag-mem-14 发送 |
-| 内部调度总线 | 写 | 新分槽创建指令 | 专属写入 | 向 ag-mem-15~19 发送 |
-| 内部调度总线 | 写 | 分槽激活信号 | 广播 | 向对应分槽及 L1 存储发送 |
-| 内部调度总线 | 写 | 维护扫描指令 | 广播 | 向 ag-mem-25/40 发送 |
-| 内部调度总线 | 写 | 分槽状态上报 | 周期性写入 | 向 ag-mem-01 发送 |
+| 全局调度总线 | 读 | F0全局熔断指令、全链路业务指标、调度配置、调度状态查询、人工运维指令 | 只读 | ag-mem-01、全漏斗业务模块、ag-mem-35、运维面板 |
+| 内部业务调度总线 | 写 | 分层晋升/归档/I刷新/遗忘清理/分槽优化调度任务指令 | 专属分发写入 | ag-mem15~30、ag-mem37/40/42 |
+| 运维告警总线 | 写 | 漏斗二全链路业务大盘、资源风险告警报表 | 专属写入 | 运维告警面板 |
+| 内部调度总线 | 写 | 调度内存容量上报、调度审计日志、周期业务统计报表 | 周期/事件写入 | ag-mem-48、ag-mem-51、ag-mem-01 |
 
-
-## 安全边界
-
+## 安全边界（V1.1漏斗调度强制规范）
 | 规则编号 | 内容 |
 |:---:|------|
-| S-01 | 漏斗二数据编译期禁止包含任何用户个人身份信息，仅存储脱敏后的任务经验与策略 |
-| S-02 | 不同场景分槽之间的经验数据物理隔离，跨槽查询需通过本模块统一路由 |
-| S-03 | 漏斗二存储空间不足时，必须优先保护 L4/L5 层关键经验，仅清理 L1/L2 低重要度条目 |
-| S-04 | 本模块仅负责分槽调度与数据路由，不直接操作经验内容 |
-| S-05 | 维护扫描期间不得中断正常查询服务，写入请求排队不得超过 5 秒 |
-
+| SCH03-01 | 所有批量任务调度必须校验ag-mem-01下发的全局熔断状态，熔断降级策略硬约束，禁止无视熔断强行下发业务任务，防止故障扩散 |
+| SCH03-02 | 无任何记忆条目读写、分槽元数据修改、持久存储操作权限，仅下发调度指令交由对应业务模块执行，操作权限分层隔离 |
+| SCH03-03 | 分层晋升周期、归档频率、批量分片上限全部由ag-mem-35集中管控，本地无硬编码调度业务参数，策略统一运维管控 |
+| SCH03-04 | 自动定时任务、人工运维操作、风险告警下发全量写入ag-mem-51审计日志，记录任务类型、作用分层/分槽、操作人员，支撑业务全链路溯源 |
+| SCH03-05 | 批量任务分片限流，单次最多下发1000条任务分片，规避瞬时大批量指令抢占总线与下游模块算力IO资源 |
+| SCH03-06 | 全熔断状态清空指标与待执行任务缓存，恢复后重新采集全链路指标生成新任务，杜绝基于过期指标下发错误调度指令 |
 
 ## 接口校验用例
-
 | 用例编号 | 前置条件 | 输入 | 预期输出 |
 |----------|----------|------|----------|
-| TC-M03-01 | `IDLE`，对话交互槽已存在 | 写入请求（场景=对话交互） | 判定场景→路由至ag-mem-15→返回写入确认 |
-| TC-M03-02 | `IDLE`，工具调用槽不存在 | 写入请求（场景=工具调用，首次） | 判定场景→创建ag-mem-16分槽→路由写入→返回写入确认 |
-| TC-M03-03 | `IDLE`，多场景匹配 | 写入请求（场景置信度接近：对话0.6/通用0.55） | 同时写入ag-mem-15和ag-mem-19，标记关联 |
-| TC-M03-04 | `IDLE`，存储空间不足 | 写入请求（漏斗二可用<最小配额） | 触发低重要度清理，若仍不足则返回错误 |
-| TC-M03-05 | `IDLE`，收到维护扫描指令 | 维护扫描信号 | 进入MAINT_SCAN，向ag-mem-25/40发送扫描指令 |
-| TC-M03-06 | `SYSTEM_PAUSED`，收到查询请求 | 任务经验查询请求 | 拒绝处理，保持暂停状态 |
-
+| TC-SCH03-01 | `FUNNEL_IDLE`，到达L3→L4定时晋升周期，L3容量达到晋升阈值 | 全分层存储容量指标快照 | 生成L3晋升批量调度任务分片下发至ag-mem25，输出业务大盘报表，写入自动调度审计日志 |
+| TC-SCH03-02 | `FUNNEL_IDLE`，L4存储占用85%容量预警阈值 | L4分层容量指标上报 | 下发加急归档扫描指令至ag-mem26、ag-mem28，风险告警写入运维大盘 |
+| TC-SCH03-03 | `FUNNEL_IDLE`，运维下发批量人工归档顶层条目指令 | 人工运维操作指令 | 拆分分片下发归档任务至ag-mem30，记录人工操作审计日志 |
+| TC-SCH03-04 | `FUNNEL_IDLE`，收到ag-mem-01下发PAUSE半熔断指令 | 全局半熔断调度指令 | 切换`FUNNEL_PAUSE`，停止所有自动晋升/归档定时任务，仅保留人工紧急操作通路 |
+| TC-SCH03-05 | `FUNNEL_IDLE`，单次自动任务生成1300条待处理条目 | 超大批量分层存量指标 | 自动拆分为2个分片串行下发调度任务，无下游模块IO阻塞 |
+| TC-SCH03-06 | `FUNNEL_PAUSE`，到达定时I值刷新周期 | 定时指标扫描触发自动任务生成 | 自动任务直接丢弃，不向ag-mem37下发刷新调度信号 |
 
 ## 质量自检清单
-
 | 检查项 | 状态 |
 |--------|:---:|
-| 模块编号与分区归属正确 | ✅ |
-| 依赖与被依赖模块编号完整 | ✅ |
-| 内部状态机6个状态含触发条件 | ✅ |
-| 输入/输出含数据类型、来源/目标模块、优先级 | ✅ |
-| 任务场景分槽路由策略表完整（5种场景含分槽编号、权重调整、遗忘保护） | ✅ |
-| 核心处理逻辑伪代码覆盖场景判定、分槽创建、查询路由、写入路由、维护扫描全流程 | ✅ |
-| 约束与异常覆盖低置信度、创建超时、空间不足、多场景匹配、维护中查询、熔断共6条 | ✅ |
-| 总线契约区分内部调度总线读写权限 | ✅ |
-| 安全边界逐条列出（含编译期脱敏条款） | ✅ |
-| 校验用例覆盖已有分槽写入、新分槽创建、多场景写入、空间不足、维护扫描、熔断共6条 | ✅ |
+| 模块编号ag-mem-03匹配白皮书漏斗二专属业务调度中枢定位 | ✅ |
+| 上下游串联前置分槽、五层存储、配套计算单元、F0全局调度，全漏斗链路闭环无冲突 | ✅ |
+| 5种完整调度状态，覆盖待机、指标采集、任务生成、任务分发、熔断降级全场景 | ✅ |
+| 输入输出完整标注收发模块、数据结构体、优先级，全链路数据流无错乱 | ✅ |
+| 分层晋升周期、归档倍率、熔断降级、分片限流规则严格对齐V1.1任务经验漏斗调度规范 | ✅ |
+| 伪代码覆盖全局熔断处理、指标缓存、自动定时任务、人工运维任务、状态查询、容量上报、审计日志全链路 | ✅ |
+| 异常场景覆盖指标缺失、超大批量任务、下游无响应、缓存溢出、配置缺失、半熔断拦截自动任务共6类全覆盖 | ✅ |
+| 总线读写权限隔离，仅具备任务分发权限，无直接修改记忆/分槽数据权限 | ✅ |
+| 6条V1.1安全约束约束熔断执行、隔离数据操作、统一策略管控、全流程审计、限流防风暴、规避过期任务 | ✅ |
+| 6条自动化测试用例覆盖全部漏斗调度核心业务场景 | ✅ |
+
+---
