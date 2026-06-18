@@ -1,353 +1,268 @@
-# ag-mem-29-L5核心层安全规则硬锁定单元 规整落地版接口规格文档
-统一对齐 ag-mem-28、ag-mem-45、ag-mem-51 配套模块文档规范，标准化结构体、梳理令牌全生命周期管控、完善安全审计链路，完整保留原生权限校验、人工双重确认、超时吊销业务逻辑，适配开发、安全审计、自动化联调测试。
-
-## 一、模块基础元信息
+# ag-mem-29-L5安全锁控单元 完整标准化接口文档（对齐EM-Core-Agent V1.1白皮书4.4.1五层单向记忆晋升通路）
+## 基本信息
 | 项 | 内容 |
 |----|------|
-| 模块唯一ID | ag-mem-29 |
-| 模块全称 | L5核心层安全规则硬锁定单元 |
-| 所属架构 | 三、漏斗二：任务经验漏斗 / 五层存储配套权限管控模块 |
-| 层级定位 | L5（ag-mem-28）唯一写入权限签发中枢，全局管控顶层永久存储写保护锁；不存储经验数据，仅负责令牌生成、安全准入校验、锁状态调度、操作审计 |
-| 核心能力 | 三类写入渠道安全准入校验、HMAC-SHA256加密临时解锁令牌签发、单令牌并发隔离、30秒自动超时吊销、人工双重确认操作、熔断强制回锁、全操作安全日志推送、周期状态指标上报 |
-| 硬性约束 | 全局仅允许1个活跃令牌；令牌有效期不可延期；人工操作必须双因子确认；所有授权/拒绝动作强制落审计日志 |
+| 模块编号 | ag-mem-29 |
+| 模块名称 | L5安全锁控单元 |
+| 所属分区 | 三、漏斗二：任务经验漏斗 / 五层单向记忆晋升通路（L5入库前置安全锁校验层） |
+| 核心职责 | 唯一上游输入为ag-mem-45安全校验通过后的抽象记忆单元；作为L5核心持久存储前置准入锁控，提供全局读写锁、分funnel隔离锁、条目保护锁三层锁机制；拦截并发重复入库、跨funnel非法写入、人工锁定条目覆盖；维护抽象单元全局唯一锁索引；校验抽象单元准入锁状态，放行无冲突条目至ag-mem-30 L5核心存储；锁冲突、重复条目、非法写入生成拦截审计日志；对外提供锁状态元数据快照供给ag-mem-37、ag-mem-40；定时上报锁索引内存占用至ag-mem-48；所有上锁、解锁、拦截、放行操作全量推送审计日志至ag-mem-51；严格隔离L5底层存储，无锁控通过禁止写入顶层永久记忆。 |
+| 依赖模块 | ag-mem-01（总控F0全局熔断调度）、ag-mem-45（安全规则合规校验单元，唯一上游抽象单元来源）、ag-mem-35（三维权重配置单元，读取锁超时时长、分funnel锁隔离规则、并发上限）、ag-mem-48（全局容量配额管控，上报锁索引内存占用） |
+| 被依赖模块 | ag-mem-30（L5核心持久存储单元，接收锁控放行后的抽象记忆单元）、ag-mem-37（重要度定时刷新单元，读取锁状态+抽象单元元数据快照）、ag-mem-40（遗忘阈值判定单元，提供锁控条目扫描数据）、ag-mem-48（接收锁索引内存占用定时上报）、ag-mem-51（推送锁控全流程审计日志）、ag-mem-03（漏斗二调度单元，周期上报锁控运行统计） |
 
-### 上下游依赖图谱
-#### 依赖模块（接收/主动调用）
-1. ag-mem-28 L5核心存储单元：下发令牌、锁状态变更通知、接收L5存储状态同步回执
-2. ag-mem-45 安全规则库：加载全局准入阈值、校验L4推送规则合规性
-3. ag-mem-01 总控F0：接收全局熔断/恢复调度指令
-4. 人工操作管理接口：管理员下发锁定/解锁/删除指令
-
-#### 被依赖模块（对外输出服务）
-1. ag-mem-16 工具调用槽：S直达写入授权结果回执
-2. ag-mem-27 L4抽象提炼单元：高置信规则推送授权回执
-3. ag-mem-28 L5存储单元：令牌下发、锁变更通知、令牌吊销指令
-4. ag-mem-51 记忆变更日志追溯单元：全量安全操作审计日志
-5. ag-mem-03 漏斗二调度单元：周期权限管控指标上报
-
-## 二、内部状态机（5种互斥运行状态）
-| 状态枚举常量 | 状态名称 | 业务含义 | 切换触发条件 |
+## 内部状态定义
+| 状态 | 标识 | 含义 | 触发条件 |
 |------|------|------|----------|
-| `LOCKED_READY` | 锁定就绪 | 默认写保护生效，无活跃令牌，可接收新授权请求 | 系统初始化；令牌超时吊销；人工强制回锁；熔断恢复 |
-| `SECURITY_CHECK` | 安全校验中 | 正在校验写入请求来源、指标阈值、合规规则 | 收到L5写入授权申请 |
-| `TEMP_UNLOCKED` | 临时解锁 | 存在有效30秒令牌，L5开放写入权限，拒绝新增授权 | 安全校验全部通过，令牌签发完成 |
-| `RELOCKING` | 锁定恢复中 | 执行令牌吊销、下发回锁通知，清理活跃令牌 | 令牌30秒超时、人工强制回锁、全局熔断 |
-| `SYSTEM_PAUSED` | 暂停服务 | 紧急熔断，立即吊销令牌，冻结全部授权流程 | F0下发FUSE熔断指令；RESUME指令切回LOCKED_READY |
+| 锁控待机就绪 | `LOCK_IDLE` | 无待校验抽象单元，锁索引空闲，等待上游推送入库快照 | 系统初始化、熔断恢复、批量条目全部放行/拦截完毕 |
+| 抽象单元锁缓存 | `LOCK_BUFFER` | 接收ag-mem-45输出抽象单元，存入临时内存缓冲 | 收到ag-mem-45批量抽象记忆单元推送 |
+| 多层锁冲突校验 | `LOCK_CHECK` | 遍历批量条目，校验全局锁、funnel分槽锁、条目独占锁，标记放行/拦截 | 缓冲条目接收完成 |
+| 放行条目下发 | `LOCK_DISPATCH` | 过滤锁冲突拦截条目，将无冲突合法抽象单元批量推送至ag-mem-30 | 全部锁校验逻辑执行完毕 |
+| 暂停服务 | `SYSTEM_PAUSED` | 全局熔断，清空全部临时缓冲与临时锁，停止锁校验、放行下发 | F0下发FUSE熔断指令；RESUME切回LOCK_IDLE |
 
-## 三、全局安全校验配置常量
-| 配置项 | 默认阈值 | 业务说明 |
-|--------|:---:|------|
-| S直达准入S值底线 | ≥0.9 | ag-mem-16通道硬性门槛 |
-| L4推送置信度底线 | ≥0.85 | ag-mem-27规则准入门槛 |
-| S直达单次授权最大条目 | 1条 | 单令牌仅允许写入1条高安全直达经验 |
-| L4推送单次授权最大条目 | 3条 | 单令牌最多写入3条合规抽象规则 |
-| 人工操作单次授权最大条目 | 10条 | 管理员批量写入上限 |
-| 临时解锁令牌有效期 | 30秒 | 硬编码，无延期接口 |
-| 人工双重确认超时窗口 | 60秒 | 挑战码有效期，超时直接驳回操作 |
-| 全局最大并发活跃令牌 | 1个 | 同一时刻仅存在1张有效令牌 |
-| 令牌签名加密算法 | HMAC-SHA256 | 防伪造、防篡改校验 |
+## 输入数据
+| 输入项 | 数据类型 | 来源模块 | 触发条件 | 优先级 |
+|--------|----------|----------|----------|:---:|
+| 安全校验通过抽象记忆单元批量快照 | List<Struct>（abs_id抽象ID、source_light_ids、funnel_id、abs_I、total_origin_reuse、abstract_vector、task_group） | ag-mem-45 安全规则合规校验单元 | ag-mem-45完成安全合规校验，推送待入库顶层抽象单元 | 高 |
+| 锁控全局规则参数回执 | Struct（锁自动释放超时ms、单funnel最大并发写入数、重复abs_id拦截开关） | ag-mem-35 三维权重配置单元 | 模块初始化、锁策略人工更新 | 普通 |
+| 抽象单元锁状态批量查询请求 | Struct（abs_id抽象ID列表） | ag-mem-37 / ag-mem-40 | 全局I值重算、顶层记忆遗忘扫描 | 高 |
+| 全局调度指令 | Enum（PAUSE/RESUME/FUSE） | ag-mem-01 总控F0 | 系统故障、紧急熔断停机 | 紧急 |
 
-### 三类写入渠道准入校验清单
-| 写入来源 | 前置校验条件 | 单次授权上限 |
-|--------|--------------|----------|
-| S值直达（ag-mem-16） | S≥0.9 + result_tag=成功 | 1 |
-| L4规则推送（ag-mem-27） | 置信度≥0.85 + ag-mem-45合规校验通过 | 3 |
-| 人工锁定写入 | 管理员身份校验 + 60秒内双重挑战码确认 | 10 |
+## 输出数据
+| 输出项 | 数据类型 | 目标模块 | 输出条件 | 优先级 |
+|--------|----------|----------|----------|:---:|
+| 锁控放行标准化抽象单元批量推送 | List<完整抽象单元元数据+锁放行标记> | ag-mem-30 L5核心持久存储单元 | 锁校验无冲突、无重复、无锁定保护条目 | 高 |
+| 抽象单元快照接收回执 | Struct（快照总条数、缓冲成功条数、锁冲突拦截条数） | ag-mem-45 安全规则合规校验单元 | 抽象单元快照完整存入临时缓冲 | 高 |
+| 抽象单元+锁状态元数据快照 | List<abs_id、当前锁类型、锁持有时长、funnel_id、abs_I> | ag-mem-37、ag-mem-40 | 收到批量锁状态查询请求 | 高 |
+| 锁索引内存占用上报 | Struct（单元标识ag-mem-29、锁索引总KB、当前活跃锁数量） | ag-mem-48 全局容量配额 | 每60秒定时上报、大批量快照处理后即时上报 | 普通 |
+| 锁控操作审计日志 | Struct（事件类型、原始抽象单元总数、放行数量、锁冲突拦截数量、锁超时释放数量、时间戳、funnel范围） | ag-mem-51 记忆变更日志追溯单元 | 每一批抽象单元锁校验处理完成 | 普通 |
+| 锁控周期运行统计上报 | Struct（当前状态、今日接收抽象单元总量、放行入库总量、锁冲突拦截总次数、自动释放锁总数） | ag-mem-03 漏斗二调度单元 | 每180秒周期性上报 | 普通 |
 
-## 四、输入总线接口（内部调度总线 只读）
-| 输入消息名称 | 结构体 | 发送方 | 触发时机 | 优先级 |
-|--------|--------|--------|----------|:---:|
-| L5写入授权请求 | L5AuthApplyReq | ag-mem-16 / ag-mem-27 / 人工接口 | 需开通L5写入权限 | 最高 |
-| 安全规则基准配置 | SecurityRuleBaseResp | ag-mem-45 | 初始化/规则动态更新 | 普通 |
-| 人工锁控操作指令 | ManualLockOperateCmd | 人工管理员接口 | 人工调整L5锁定状态、批量删除 | 最高 |
-| L5存储状态同步回执 | L5SyncStateResp | ag-mem-28 | 周期同步L5容量、锁定状态 | 普通 |
-| 全局调度控制指令 | F0ControlEnum | ag-mem-01 | 熔断/暂停/恢复服务 | 紧急 |
-| 内部令牌超时定时器信号 | TimerSignal | 模块内部 | 令牌签发满30秒 | 高 |
+## L5安全锁控核心规则（V1.1顶层记忆安全准入规范）
+### 1. 全局锁控配置参数（ag-mem-35统一分发）
+1. 锁自动释放超时：300000ms（5分钟），超时未完成入库自动解锁；
+2. 单funnel最大并发写入锁：10条，超出上限触发分槽锁拦截；
+3. 重复abs_id拦截开关：永久开启，同一抽象ID禁止重复写入L5；
+4. 三层锁优先级：条目独占锁 > 分funnel并发锁 > 全局总写入锁。
 
-### 入参核心结构体定义
-1. **L5AuthApplyReq 写入授权申请**
-```json
-{
-  "source_module": "enum[S直达/L4推送/人工锁定]",
-  "write_reason": "业务写入说明",
-  "item_id_list": ["待写入条目ID数组"],
-  "S_value": "float 安全显著性（S直达渠道必填）",
-  "rule_confidence": "float 规则置信度（L4推送渠道必填）",
-  "apply_write_cnt": "int 申请写入条目数量"
-}
+### 2. 条目拦截判定规则（满足任意一条直接拦截，不推送ag-mem-30）
+1. abs_id已存在全局锁索引，重复入库；
+2. 对应funnel当前活跃写入锁达到并发上限；
+3. 条目携带manual人工锁定标记，禁止覆盖写入；
+4. 全局总活跃锁达到系统全局写入并发阈值。
+
+### 3. 流转强制约束
+1. 唯一上游：仅接收ag-mem-45校验通过抽象单元，拒绝其他模块直接推送入库数据；
+2. 单向下游：仅放行条目推送至ag-mem-30 L5核心存储，无任何旁路跳过锁控直达L5；
+3. 无持久业务存储：仅维护内存锁索引与临时缓冲，不持久化抽象单元原始数据；
+4. 不参与I值计算、归档、抽象提炼业务逻辑，仅负责顶层入库并发安全管控。
+
+### 4. 批量约束
+单次接收抽象单元快照最大1000条，超量自动分片串行执行锁校验，防止锁索引并发竞争过载。
+
+## 核心处理逻辑
 ```
-2. **ManualLockOperateCmd 人工操作指令**
-```json
-{
-  "operate_type": "enum[人工解锁/强制恢复锁定/批量删除]",
-  "admin_id": "管理员唯一ID",
-  "admin_security_token": "管理员身份校验串",
-  "operate_note": "操作事由备注"
-}
-```
-3. **F0ControlEnum 全局指令枚举**
-`PAUSE / RESUME / FUSE`
-
-## 五、输出总线接口（内部调度总线 专属写入）
-| 输出消息名称 | 结构体 | 接收模块 | 发送时机 | 优先级 |
-|--------|--------|--------|----------|:---:|
-| 临时解锁令牌下发 | L5UnlockTokenMsg | ag-mem-28 | 安全校验全部通过 | 最高 |
-| 授权拒绝通知 | AuthRejectNotify | ag-mem-16/27/人工接口 | 任意准入校验失败 | 最高 |
-| 锁状态变更通知 | LockStateChangeNotify | ag-mem-28 | 锁定/解锁状态切换 | 最高 |
-| 令牌吊销指令 | TokenRevokeCmd | ag-mem-28 | 超时/人工/熔断强制回收令牌 | 最高 |
-| 安全审计事件日志 | SecurityAuditLog | ag-mem-51 | 每一次授权/拒绝/人工操作 | 高 |
-| 锁控周期状态上报 | LockControlStatReport | ag-mem-03 | 每120秒/状态变更瞬间 | 普通 |
-
-### 出参核心结构体定义
-1. **L5UnlockTokenMsg 临时解锁令牌**
-```json
-{
-  "token_id": "L5-TOKEN-UUID",
-  "max_write_limit": "本次授权最大可写入条目数",
-  "valid_second": 30,
-  "hmac_sign": "HMAC-SHA256加密签名串",
-  "create_ts": "long 令牌生成时间戳"
-}
-```
-2. **AuthRejectNotify 授权拒绝通知**
-```json
-{
-  "source": "申请来源模块",
-  "reject_root_cause": "标准化失败原因",
-  "fail_check_item": "校验失败维度（S值/置信度/合规/并发令牌）"
-}
-```
-3. **SecurityAuditLog 安全审计日志**
-```json
-{
-  "event_type": "enum[授权成功/授权拒绝/人工解锁/强制回锁/令牌吊销]",
-  "operate_source": "操作发起方",
-  "result_desc": "操作结果详情",
-  "event_ts": "long 事件发生时间戳",
-  "token_id": "关联令牌ID（如有）"
-}
-```
-4. **LockControlStatReport 周期上报指标**
-```json
-{
-  "current_state": "模块状态枚举",
-  "total_auth_success": "累计授权成功次数",
-  "total_auth_reject": "累计授权拒绝次数",
-  "active_token_count": "当前有效令牌数量（0/1）"
-}
-```
-
-## 六、完整业务主流程伪代码（注释优化版）
-```python
 FUNCTION l5_lock_control_main_loop():
-    # 状态常量定义
-    STATE_LOCKED = "LOCKED_READY"
-    STATE_CHECK = "SECURITY_CHECK"
-    STATE_UNLOCKED = "TEMP_UNLOCKED"
-    STATE_RELOCK = "RELOCKING"
-    STATE_PAUSE = "SYSTEM_PAUSED"
+    STATE_IDLE = LOCK_IDLE
+    STATE_BUFFER = LOCK_BUFFER
+    STATE_CHECK = LOCK_CHECK
+    STATE_DISPATCH = LOCK_DISPATCH
+    STATE_PAUSED = SYSTEM_PAUSED
 
-    internal_state = STATE_LOCKED
-    # 加载安全阈值基准
-    security_rule = load_security_base_from_m45()
-    active_token = None
-    token_create_ts = 0
-    # 统计指标
-    stat_auth_ok = 0
-    stat_auth_reject = 0
+    internal_state = STATE_IDLE
+    // 加载锁控全局配置
+    lock_cfg = query_lock_config(from_m35="ag-mem-35")
+    lock_timeout_ms = lock_cfg.lock_release_timeout
+    max_slot_concurrent = lock_cfg.per_funnel_max_lock
+    global_max_lock = lock_cfg.global_max_active_lock
+    temp_buffer = []
+    global_lock_index = {} // key:abs_id, value:{funnel_id, lock_start_ts}
+    funnel_lock_counter = {} // key:funnel_id, value:active_lock_num
+    stat_raw_abs_total = 0
+    stat_pass_count = 0
+    stat_block_count = 0
+    stat_auto_release_lock = 0
+    last_report_ts = NOW()
 
-    WHILE system_running:
-        # 1. 最高优先级：全局熔断调度指令
-        if recv_global_f0_cmd():
-            cmd = get_f0_cmd()
-            if cmd == "FUSE":
-                internal_state = STATE_PAUSE
-                # 熔断强制吊销令牌
-                if active_token is not None:
-                    revoke_token_process(revoke_reason="全局紧急熔断")
-                continue
-            if cmd == "RESUME" and internal_state == STATE_PAUSE:
-                internal_state = STATE_LOCKED
+    WHILE 系统运行中:
+        // 1. 全局熔断最高优先级处理
+        IF 收到全局调度指令:
+            cmd = 获取调度指令
+            IF cmd == "FUSE":
+                internal_state = STATE_PAUSED
+                temp_buffer.clear()
+                global_lock_index.clear()
+                funnel_lock_counter.clear()
+                CONTINUE
+            IF cmd == "RESUME" AND internal_state == SYSTEM_PAUSED:
+                internal_state = LOCK_IDLE
 
-        # 2. 令牌30秒超时检测
-        if internal_state == STATE_UNLOCKED:
-            if NOW() - token_create_ts > 30 * 1000:
-                internal_state = STATE_RELOCK
-                revoke_token_process(revoke_reason="令牌30秒超时自动恢复锁定")
+        // 定时自动释放超时锁
+        now_ts = NOW()
+        expired_abs_list = []
+        for abs_id, lock_info in global_lock_index.items():
+            if now_ts - lock_info.lock_start_ts >= lock_timeout_ms:
+                expired_abs_list.append(abs_id)
+        for expire_abs in expired_abs_list:
+            expire_funnel = global_lock_index[expire_abs].funnel_id
+            del global_lock_index[expire_abs]
+            funnel_lock_counter[expire_funnel] -= 1
+            stat_auto_release_lock += 1
 
-        # 3. 接收L5写入授权申请
-        if recv_l5_auth_apply():
-            apply_req = get_auth_apply()
-            # 并发令牌拦截：已有活跃令牌直接拒绝
-            if internal_state == STATE_UNLOCKED:
-                send_auth_reject(
-                    source=apply_req.source_module,
-                    reason="已有活跃写入令牌，请等待令牌过期或吊销"
+        // 2. 接收ag-mem-45抽象记忆单元快照
+        IF 收到安全校验通过抽象记忆单元批量快照:
+            snapshot_data = 获取快照条目列表
+            internal_state = LOCK_BUFFER
+            temp_buffer.extend(snapshot_data)
+            cache_total = len(temp_buffer)
+            stat_raw_abs_total += len(snapshot_data)
+            // 返回快照接收回执给ag-mem-45
+            recv_ack = build_snapshot_recv_ack(total=len(snapshot_data), cached=cache_total, block_temp=0)
+            send_ack(target="ag-mem-45", ack_data=recv_ack)
+            internal_state = LOCK_CHECK
+
+            // 3. 三层锁冲突校验逻辑
+            pass_list = []
+            block_list = []
+            block_reason_map = {}
+            for abs_item in temp_buffer:
+                abs_id = abs_item.abs_id
+                f_id = abs_item.funnel_id
+                block_reason = ""
+                // 规则1：重复abs_id全局锁拦截
+                if abs_id in global_lock_index:
+                    block_reason = "abs_id已存在全局锁索引，禁止重复入库"
+                // 规则2：分funnel并发锁超限拦截
+                elif funnel_lock_counter.get(f_id, 0) >= max_slot_concurrent:
+                    block_reason = f"funnel{f_id}并发写入锁达到上限{max_slot_concurrent}"
+                // 规则3：全局总锁超限拦截
+                elif len(global_lock_index) >= global_max_lock:
+                    block_reason = "全局活跃写入锁达到系统上限"
+                // 规则4：人工锁定条目拦截
+                elif abs_item.get("manual_tag", "无") in ["用户收藏", "人工锁定"]:
+                    block_reason = "条目人工锁定，禁止覆盖写入L5"
+
+                if block_reason != "":
+                    block_list.append(abs_item)
+                    block_reason_map[abs_id] = block_reason
+                    stat_block_count += 1
+                    continue
+                // 无冲突，加锁放行
+                pass_list.append(abs_item)
+                // 写入全局锁索引
+                global_lock_index[abs_id] = {
+                    "funnel_id": f_id,
+                    "lock_start_ts": now_ts
+                }
+                // 分槽锁计数+1
+                if f_id not in funnel_lock_counter:
+                    funnel_lock_counter[f_id] = 0
+                funnel_lock_counter[f_id] += 1
+                stat_pass_count += 1
+            temp_buffer.clear()
+            internal_state = LOCK_DISPATCH
+
+            // 4. 批量下发放行抽象单元至ag-mem-30
+            if len(pass_list) > 0:
+                send_pass_abs_batch(target="ag-mem-30", item_list=pass_list)
+            // 写入锁控审计日志
+            audit_log = build_lock_audit_log(
+                raw_abs_count=len(snapshot_data),
+                pass_num=len(pass_list),
+                block_num=len(block_list),
+                expire_lock_num=len(expired_abs_list),
+                ts=now_ts
+            )
+            send_audit_log(target="ag-mem-51", log_data=audit_log)
+            internal_state = LOCK_IDLE
+
+        // 5. 抽象单元锁状态批量查询响应
+        IF 收到抽象单元锁状态批量查询请求:
+            query_abs_ids = 获取abs_id列表
+            meta_snap = []
+            for abs_id in query_abs_ids:
+                lock_info = global_lock_index.get(abs_id, None)
+                item_meta = query_abs_basic_meta(abs_id)
+                meta_snap.append({
+                    "abs_id": abs_id,
+                    "lock_status": "locked" if lock_info else "free",
+                    "lock_funnel": lock_info.funnel_id if lock_info else None,
+                    "lock_hold_ms": now_ts - lock_info.lock_start_ts if lock_info else 0,
+                    **item_meta
+                })
+            send_meta_snapshot(target="ag-mem-37", meta_list=meta_snap)
+            send_meta_snapshot(target="ag-mem-40", meta_list=meta_snap)
+
+        // 6. 定时锁索引内存上报 + 180s周期统计上报
+        IF NOW() - last_report_ts >= 60 * 1000:
+            lock_index_kb = calc_lock_index_kb(global_lock_index, lock_cfg.avg_lock_meta_kb)
+            cap_report = build_cap_report(layer="ag-mem-29", used_kb=lock_index_kb, active_lock_count=len(global_lock_index))
+            send_cap_report(target="ag-mem-48", report=cap_report)
+            // 每180s上报运行统计至ag-mem-03
+            IF NOW() - last_report_ts >= 180 * 1000:
+                stat_report = build_lock_stat_report(
+                    state=internal_state,
+                    total_raw_abs=stat_raw_abs_total,
+                    total_pass=stat_pass_count,
+                    total_block=stat_block_count,
+                    total_auto_release=stat_auto_release_lock
                 )
-                stat_auth_reject += 1
-                write_audit_log("授权拒绝", apply_req.source_module, "并发令牌冲突")
-                continue
-
-            internal_state = STATE_CHECK
-            source_type = apply_req.source_module
-            s_val = apply_req.S_value
-            conf = apply_req.rule_confidence
-            pass_check = False
-            max_allow_write = 0
-            reject_msg = ""
-
-            # 渠道分支校验
-            if source_type == "S值直达":
-                if s_val >= security_rule.S_min_threshold:
-                    pass_check = True
-                    max_allow_write = 1
-                else:
-                    reject_msg = f"S值未达标，当前{s_val}，要求≥{security_rule.S_min_threshold}"
-            elif source_type == "L4推送":
-                if conf >= security_rule.conf_min_threshold:
-                    # 调用ag-mem-45合规校验
-                    compliance_resp = call_m45_check(apply_req.item_id_list)
-                    if compliance_resp.pass_flag:
-                        pass_check = True
-                        max_allow_write = min(apply_req.apply_write_cnt, 3)
-                    else:
-                        reject_msg = f"安全合规校验失败：{compliance_resp.reason}"
-                else:
-                    reject_msg = f"规则置信度不足，当前{conf}，要求≥{security_rule.conf_min_threshold}"
-            elif source_type == "人工锁定":
-                # 人工双重确认流程
-                double_confirm_res = launch_admin_double_verify(apply_req.admin_id, timeout=60*1000)
-                if double_confirm_res.pass_flag:
-                    pass_check = True
-                    max_allow_write = min(apply_req.apply_write_cnt, 10)
-                else:
-                    reject_msg = "人工双重确认超时或验证失败"
-            else:
-                reject_msg = "非法写入来源，不在白名单内"
-
-            # 校验结果分支
-            if pass_check:
-                internal_state = STATE_UNLOCKED
-                token_create_ts = NOW()
-                # 生成加密令牌
-                new_token = generate_hmac_token(max_allow_write)
-                active_token = new_token
-                # 下发令牌与锁变更通知至ag-mem-28
-                send_token_to_m28(new_token)
-                send_lock_state_notify(target="ag-mem-28", new_state="UNLOCKED", token=new_token)
-                stat_auth_ok += 1
-                write_audit_log("授权成功", source_type, f"最大写入上限{max_allow_write}")
-            else:
-                send_auth_reject(source=source_type, reason=reject_msg)
-                stat_auth_reject += 1
-                write_audit_log("授权拒绝", source_type, reject_msg)
-                internal_state = STATE_LOCKED
-
-        # 4. 处理人工锁控操作指令
-        if recv_manual_lock_cmd():
-            cmd = get_manual_lock_cmd()
-            # 所有人工操作强制双重确认
-            verify_res = launch_admin_double_verify(cmd.admin_id, timeout=60*1000)
-            if not verify_res.pass_flag:
-                send_manual_operate_reject("双重确认验证失败/超时")
-                continue
-
-            if cmd.operate_type == "强制恢复锁定":
-                internal_state = STATE_RELOCK
-                revoke_token_process(revoke_reason="人工强制回锁操作")
-                internal_state = STATE_LOCKED
-                write_audit_log("人工操作", "管理员", "执行强制恢复L5锁定")
-            elif cmd.operate_type == "人工解锁":
-                if internal_state == STATE_LOCKED:
-                    internal_state = STATE_UNLOCKED
-                    token_create_ts = NOW()
-                    manual_token = generate_hmac_token(max_write=10)
-                    active_token = manual_token
-                    send_token_to_m28(manual_token)
-                    send_lock_state_notify("ag-mem-28", "UNLOCKED", manual_token)
-                    write_audit_log("人工解锁授权", "管理员", "人工下发解锁令牌")
-
-        # 5. 统一令牌吊销子流程执行
-        if internal_state == STATE_RELOCK:
-            if active_token is not None:
-                send_token_revoke_cmd(target="ag-mem-28", token_id=active_token.token_id, revoke_cause=revoke_reason)
-                send_lock_state_notify("ag-mem-28", "LOCKED", None)
-                active_token = None
-            internal_state = STATE_LOCKED
-
-        # 6. 每120秒周期状态上报
-        if NOW() - last_report_ts >= 120 * 1000:
-            report = build_stat_report(internal_state, stat_auth_ok, stat_auth_reject, active_token)
-            send_stat_report(report, target="ag-mem-03")
+                send_stat_report(target="ag-mem-03", report=stat_report)
             last_report_ts = NOW()
 
-        SLEEP(10)
-
-# 子函数：令牌吊销统一流程
-FUNCTION revoke_token_process(revoke_reason):
-    if active_token is None:
-        return
-    send_token_revoke_cmd("ag-mem-28", active_token.token_id, revoke_reason)
-    send_lock_state_notify("ag-mem-28", "LOCKED", None)
-    write_audit_log("令牌吊销", "ag-mem-29", revoke_reason)
-    active_token = None
+        SLEEP 10ms
 ```
 
-## 七、异常故障处理矩阵
-| 故障场景 | 处理逻辑 | 恢复条件 |
-|--------|----------|----------|
-| ag-mem-45安全规则基准加载失败 | 启用编译内置默认阈值（S≥0.9、置信≥0.85），打印降级告警日志 | ag-mem-45服务恢复连通 |
-| 人工双重确认60秒超时 | 直接驳回操作，记录超时审计日志 | 管理员重新发起操作并完成双因子验证 |
-| 已有活跃令牌时收到新授权申请 | 拒绝全部新申请，提示并发令牌冲突 | 当前令牌超时/人工吊销后可重新申请 |
-| L5存储校验令牌签名篡改 | ag-mem-28拦截写入，本模块接收异常回执后上报告警，自动吊销该令牌 | 重新发起授权流程生成全新合法令牌 |
-| 全局紧急熔断指令下发 | 立刻吊销活跃令牌、下发回锁通知，冻结全部授权流程 | 总控下发RESUME恢复指令 |
+## 约束与异常处理
+| 场景 | 处理方式 | 恢复条件 |
+|------|----------|----------|
+| ag-mem-45推送抽象单元abs_id缺失、元数据非法 | 本条直接拦截，日志标记异常，不进入锁校验 | ag-mem-45重新推送完整标准化抽象单元快照 |
+| 单次快照条目超1000条上限 | 自动分片分批缓存、锁校验，串行执行不产生锁风暴 | 内置分片逻辑自动执行 |
+| 锁索引内存占用溢出 | 优先自动释放超时锁，仍溢出则拦截新入库条目并告警 | 扩容内存或调小锁超时阈值 |
+| ag-mem-30接收放行条目无响应 | 保留锁索引不释放，下一轮扫描重试下发，持续失败生成告警审计 | ag-mem-30存储服务恢复正常接收 |
+| 全局FUSE熔断触发 | 清空临时缓冲、全部活跃锁索引，终止校验与下发 | ag-mem-01下发RESUME恢复指令 |
+| 分funnel无并发锁配置 | 加载全局通用最大并发锁数值兜底校验 | ag-mem-35运维侧补充分funnel锁控参数 |
 
-## 八、内部调度总线访问契约
-| 总线方向 | 消息类型 | 访问权限 | 通信双方 |
-|--------|----------|----------|----------|
-| 读（入站） | L5写入授权申请、安全规则基准、人工锁控指令、L5状态回执、全局熔断指令、定时器信号 | 只读 | ag-mem16/27/28/45/01/人工接口 → ag-mem-29 |
-| 写（出站） | 临时解锁令牌、锁状态变更通知、令牌吊销指令 | 模块专属写入 | ag-mem-29 → ag-mem-28 |
-| 写（出站） | 授权拒绝通知、人工操作驳回通知 | 模块专属写入 | ag-mem-29 → ag-mem16/27/人工接口 |
-| 写（出站） | 安全审计日志 | 模块专属写入 | ag-mem-29 → ag-mem-51 |
-| 写（出站） | 周期锁控指标上报 | 周期性写入 | ag-mem-29 → ag-mem-03 |
+## 总线契约
+| 总线 | 操作 | 数据内容 | 权限 | 说明 |
+|------|------|----------|------|------|
+| 内部调度总线 | 读 | 安全校验通过抽象单元快照 | 只读 | ag-mem-45 唯一上游输入 |
+| 内部调度总线 | 读 | 锁控规则配置回执、全局熔断指令 | 只读 | ag-mem-35、ag-mem-01 |
+| 内部调度总线 | 读 | 锁状态批量查询请求 | 只读 | ag-mem-37、ag-mem-40 |
+| 内部调度总线 | 写 | 快照接收回执 | 专属写入 | 返回上游 ag-mem-45 |
+| 内部调度总线 | 写 | 锁控放行抽象单元批量推送 | 专属写入 | 下发下游 ag-mem-30 |
+| 内部调度总线 | 写 | 锁状态元数据快照、容量上报、审计日志、周期统计 | 事件/周期写入 | ag-mem-37/40、ag-mem-48、ag-mem-51、ag-mem-03 |
 
-## 九、强制安全边界（审计校验硬规则）
-| 编号 | 约束规则 |
+## 安全边界（V1.1强制规范）
+| 规则编号 | 内容 |
 |:---:|------|
-| S-01 | L5所有写入操作必须持有本模块签发的有效令牌，绕过本模块直写L5会被ag-mem-28直接拦截拒绝 |
-| S-02 | 令牌30秒有效期为底层硬编码，无任何对外接口支持延期、续期 |
-| S-03 | 系统全局同一时间仅允许1张有效活跃令牌，杜绝多渠道并发写入顶层永久记忆 |
-| S-04 | 全部人工解锁、回锁、删除操作强制执行双重确认流程，单次操作独立验证，不可复用上次验证凭证 |
-| S-05 | 所有授权成功、授权拒绝、令牌吊销、人工操作必须完整写入ag-mem-51审计日志，日志不可删除篡改 |
-| S-06 | 全局熔断触发时，无条件吊销全部活跃令牌，强制L5恢复物理写保护锁定 |
+| L29-01 | 仅允许ag-mem-45推送待入库抽象单元，阻断所有其他模块旁路写入顶层存储，杜绝非法记忆流入L5 |
+| L29-02 | 顶层入库强制必经三层锁校验，无任何跳过锁控直达ag-mem-30的流转通道，顶层记忆写入链路强制隔离 |
+| L29-03 | 无持久化业务数据存储，仅内存维护锁索引，服务重启自动清空所有锁，避免长期锁占用死锁 |
+| L29-04 | 锁超时、分槽并发上限、全局锁上限全部由ag-mem-35集中管控，本地无硬编码锁参数 |
+| L29-05 | 所有上锁、放行、锁冲突拦截、自动解锁操作完整写入ag-mem-51审计日志，记录abs_id与funnel关联关系，支撑顶层写入溯源审计 |
+| L29-06 | 熔断状态清空全部活跃锁与待处理缓冲，恢复后重新走完整校验流程，杜绝过期锁导致的死锁、重复写入问题 |
 
-## 十、自动化功能测试用例全覆盖
-| 用例编号 | 前置条件 | 输入消息 | 预期输出结果 |
+## 接口校验用例
+| 用例编号 | 前置条件 | 输入 | 预期输出 |
 |----------|----------|------|----------|
-| TC-M29-01 | LOCKED_READY，S直达申请S=0.95 | S值直达写入授权请求 | 签发30秒令牌，最大写入1条，状态切换TEMP_UNLOCKED，审计日志记录授权成功 |
-| TC-M29-02 | LOCKED_READY，S直达申请S=0.75 | S值直达写入授权请求 | 拒绝授权，返回S值未达标，审计日志记录拒绝 |
-| TC-M29-03 | LOCKED_READY，L4推送置信0.90、合规校验通过 | L4推送授权申请 | 签发令牌，最大写入3条，下发至ag-mem-28 |
-| TC-M29-04 | LOCKED_READY，来源标记为未知模块 | 非法来源授权申请 | 直接拒绝，提示非法写入来源 |
-| TC-M29-05 | TEMP_UNLOCKED（存在有效令牌） | 新S直达授权申请 | 拒绝新申请，提示已有活跃令牌 |
-| TC-M29-06 | TEMP_UNLOCKED，等待30秒超时 | 内部定时器超时信号 | 自动吊销令牌，下发回锁通知，切回LOCKED_READY |
+| TC-M29-01 | `LOCK_IDLE`，ag-mem-45推送全新无冲突抽象单元快照 | 合规抽象单元批量快照 | 三层锁校验全部通过，加全局+分槽锁，批量推送至ag-mem-30，生成放行审计日志 |
+| TC-M29-02 | `LOCK_IDLE`，快照内包含已存在abs_id重复条目 | 含重复abs_id快照 | 重复条目拦截，其余合法条目正常放行，日志标记重复入库原因 |
+| TC-M29-03 | `LOCK_IDLE`，目标funnel已达到并发写入锁上限 | 同funnel大批量抽象单元 | 超出并发部分全部拦截，未达上限条目正常放行 |
+| TC-M29-04 | `LOCK_IDLE`，单批快照1200条抽象单元 | 超大批量入库快照 | 自动分片串行锁校验，无锁风暴、无内存溢出 |
+| TC-M29-05 | `LOCK_IDLE`，ag-mem-37下发abs_id批量锁状态查询 | 抽象ID批量查询请求 | 返回每条条目锁定状态、锁持有时长、关联funnel完整元数据快照 |
+| TC-M29-06 | `LOCK_IDLE`，接收全局FUSE熔断指令 | 紧急熔断调度指令 | 切换SYSTEM_PAUSED，清空缓冲与全部活跃锁，停止锁校验与条目下发 |
 
-## 十一、交付验收自检清单
-| 检查项 | 完成状态 |
+## 质量自检清单
+| 检查项 | 状态 |
 |--------|:---:|
-| 模块编号、漏斗二配套权限管控定位准确 | ✅ |
-| 上下游依赖、被依赖模块完整无遗漏 | ✅ |
-| 5种内部状态+完整切换触发条件定义清晰 | ✅ |
-| 全部输入输出附带结构体、收发模块、优先级 | ✅ |
-| 三类写入渠道校验、令牌签发参数、人工双确认流程完整 | ✅ |
-| 伪代码覆盖渠道校验、令牌生成、超时吊销、人工操作、审计日志、周期上报全链路 | ✅ |
-| 异常场景覆盖5类典型故障处理逻辑 | ✅ |
-| 内部调度总线读写权限划分清晰 | ✅ |
-| 6条强制安全约束无逻辑漏洞 | ✅ |
-| 6条测试用例覆盖全部核心业务分支 | ✅ |
+| 模块编号ag-mem-29匹配白皮书L5入库前置安全锁控单元定位 | ✅ |
+| 上游仅ag-mem-45、下游仅ag-mem-30，数据流闭环无冲突 | ✅ |
+| 5种内部状态切换逻辑完整，覆盖缓冲、锁校验、放行全流程 | ✅ |
+| 输入输出完整标注收发模块、结构体、优先级，上下游链路无错乱 | ✅ |
+| 三层锁机制、超时自动释放、并发拦截规则严格对齐V1.1顶层记忆安全准入设计 | ✅ |
+| 伪代码覆盖快照接收、三层锁校验、超时解锁、批量放行、审计日志、容量上报全链路 | ✅ |
+| 异常场景覆盖非法抽象单元、超大批次、内存溢出、下游无响应、熔断、无分槽锁配置共6类全覆盖 | ✅ |
+| 总线读写权限隔离，仅允许ag-mem-45推送待入库抽象单元 | ✅ |
+| 6条安全约束杜绝旁路写入、绕过锁控、长期死锁、顶层数据篡改风险 | ✅ |
+| 6条测试用例覆盖全部核心锁控业务场景 | ✅ |
 
-## 模块联动补充说明（对接ag-mem-28、ag-mem-45）
-1. ag-mem-28仅负责存储校验令牌签名、有效期，**无令牌生成、权限校验能力**，所有准入规则统一由ag-mem-29管控；
-2. L4推送渠道必须二次调用ag-mem-45做安全规则合规校验，本模块不内置安全规则库，仅读取基准阈值；
-3. 所有权限变更、写入授权动作全量推送ag-mem-51日志单元，满足安全审计追溯要求；
-4. 令牌吊销分为三类触发：30秒自动超时、人工强制回锁、全局熔断，三类场景均同步通知ag-mem-28更新锁状态；
-5. 本模块仅管控写入权限，不参与L5经验存储、查询、删除逻辑，删除操作仅下发锁控指令，实际数据清理由配套人工运维单元执行。
+---
