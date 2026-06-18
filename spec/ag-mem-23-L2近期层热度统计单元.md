@@ -1,321 +1,248 @@
-## V1.1 模块升级总说明
-### 重大变更点
-1. 废弃V1.0基于固定ag-mem-15~19分槽的统计维度，重构为`funnel_id`动态子漏斗独立隔离统计，各领域热度数据互不干扰；
-2. 新增哈希标签热度联动统计：条目命中同步更新单条目标签分布、漏斗全局标签聚合热度，为检索权重、晋升判定提供标签维度参考；
-3. 全链路输入输出统一新增`funnel_id`、`index_bucket_id`、`hash_tag_list`，与ag-mem-01/22/38/33全模块字段互通兼容；
-4. 内存存储结构分层重构，顶层以funnel为根分区，实现单漏斗独立计数、独立标签聚合；
-5. 定时清理逻辑升级为全漏斗批量快照比对，一次性删除所有已从L2移除条目的失效统计；
-6. 新增全局熔断管控分支，熔断状态阻断所有统计写入，仅保留存量查询能力；
-7. 原有核心统计能力（条目命中计数、24h/7d/全生命周期窗口统计、周期上报）完整保留，仅增加funnel与标签扩展分支，无原有业务逻辑丢失；
-8. 增加非法漏斗自动创建+异常标记机制，兼容漏斗新建、合并过程中时序错位产生的临时未知funnel事件。
-
-
-
-# ag-mem-23-L2近期层热度统计单元 接口规格（V1.1 适配funnel分桶+哈希索引架构）
----
+# ag-mem-23-L3辅助归并单元 完整标准化接口文档（对齐EM-Core-Agent V1.1白皮书4.4.1五层单向记忆晋升通路）
 ## 基本信息
 | 项 | 内容 |
 |----|------|
 | 模块编号 | ag-mem-23 |
-| 模块名称 | L2近期层热度统计单元 |
-| 所属分区 | 三、漏斗二：任务经验漏斗 / 五层存储 |
-| 核心职责 | 面向动态funnel分桶架构，独立统计每个子漏斗内经验条目检索命中频次。接收ag-mem-22推送的分funnel新增条目通知、查询命中事件；按`funnel_id`隔离维护热度统计内存表，每条统计绑定`entry_id + funnel_id`二元主键，同步记录条目关联hash标签访问热度。<br>对外提供单/批量条目热度窗口数据，作为ag-mem-33（C复用频次统计）、ag-mem-38（晋升双条件判定）的权重输入；支持按funnel维度聚合热度指标，用于全局漏斗资源调度。<br>仅做命中事件采集、窗口计数聚合、标签热度统计，不读取原始经验正文、不参与晋升/清理决策；内存级临时统计，不持久化落地。 |
-| 依赖模块 | ag-mem-01（总控F0，下发全局熔断指令、读取合法funnel注册表）、ag-mem-22（L2存储，推送分funnel新增条目、命中事件、全漏斗有效条目ID快照）、ag-mem-33（复用频次C值单元，批量拉取L2分层热度数据）、ag-mem-38（晋升判定单元，查询单funnel条目热度权重） |
-| 被依赖模块 | ag-mem-33（输出分funnel窗口命中统计）、ag-mem-38（输出条目热度权重+标签热度分布）、ag-mem-03（漏斗二调度，接收周期性全漏斗热度汇总上报） |
+| 模块名称 | L3辅助归并单元 |
+| 所属分区 | 三、漏斗二：任务经验漏斗 / 五层单向记忆晋升通路 |
+| 核心职责 | 上游唯一输入来源为ag-mem-22推送的晋升预聚合快照，作为L2→L3中间预处理单元；基于funnel_id、行为语义、任务标签对多条同类低频次条目做合并聚合，压缩重复经验、统一加权计算聚合后I值、复用次数、S值；过滤无聚合价值的零散单一条目，将完成归并的标准化批量条目单向推送至ag-mem-24 L3中期存储；输出归并统计快照供给ag-mem-37、ag-mem-40用于全局I刷新与遗忘扫描；定时上报归并处理容量开销至ag-mem-48；所有条目归并、拆分、过滤操作推送审计日志至ag-mem-51；无独立持久存储，仅做内存临时聚合计算，不长期留存原始条目；严格遵循V1.1「聚合降噪、精简中长期记忆」设计规范，禁止跨层直通L4/L5。 |
+| 依赖模块 | ag-mem-01（总控F0全局熔断调度）、ag-mem-22（L2近期层，唯一上游快照来源）、ag-mem-35（三维权重配置单元，读取归并相似度阈值、聚合加权系数、分funnel归并规则）、ag-mem-48（全局容量配额管控，上报临时计算内存占用） |
+| 被依赖模块 | ag-mem-24（L3中期存储层，接收归并完成标准化条目）、ag-mem-37（重要度定时刷新单元，读取归并后条目元数据快照）、ag-mem-40（遗忘阈值判定单元，提供归并条目扫描数据）、ag-mem-48（接收归并计算内存占用上报）、ag-mem-51（推送归并操作审计日志）、ag-mem-03（漏斗二调度单元，周期上报归并运行统计） |
 
 ## 内部状态定义
 | 状态 | 标识 | 含义 | 触发条件 |
 |------|------|------|----------|
-| 空闲等待 | `IDLE` | 无更新/查询任务，等待funnel维度事件推送 | 初始化完成，各funnel统计分区创建完毕 |
-| 统计更新中 | `UPDATING` | 批量更新某funnel下条目命中计数、标签热度 | 收到ag-mem-22分funnel命中条目列表 |
-| 查询响应中 | `RESPONDING` | 处理外部模块批量热度查询，按funnel隔离返回数据 | ag-mem-33/ag-mem-38发起热度查询请求 |
-| 暂停服务 | `SYSTEM_PAUSED` | 全局熔断，停止所有统计写入、仅存量数据只读查询 | 接收ag-mem-01全局熔断调度指令 |
+| 待机就绪 | `MERGE_IDLE` | 等待ag-mem-22下发预聚合快照，空闲无计算任务 | 系统初始化、熔断恢复、整批条目归并处理完毕 |
+| 快照接收缓存 | `SNAPSHOT_CACHE` | 接收L2批量预聚合条目快照，存入临时内存缓冲 | 收到ag-mem-22晋升预聚合快照推送 |
+| 语义分组归并计算 | `SEMANTIC_MERGE` | 按funnel、语义向量、任务标签分组，加权合并同类条目，生成聚合后统一元数据 | 快照缓存接收完成 |
+| 标准化条目下发 | `ITEM_DISPATCH` | 过滤无聚合价值零散条目，批量推送归并完成条目至ag-mem-24，输出元数据快照 | 分组归并全部计算完成 |
+| 暂停服务 | `SYSTEM_PAUSED` | 全局熔断，清空临时缓存，停止所有归并计算与快照处理 | F0下发FUSE熔断指令；RESUME切回MERGE_IDLE |
 
-## 输入数据（V1.1 删除固定分槽编号，新增funnel、hash_tag、index_bucket字段）
+## 输入数据
 | 输入项 | 数据类型 | 来源模块 | 触发条件 | 优先级 |
 |--------|----------|----------|----------|:---:|
-| 分funnel L2新条目通知 | Struct(funnel_id, index_bucket_id, new_entry_ids:List, hash_tag_list:List[List], write_ts) | ag-mem-22 L2存储单元 | L2完成分funnel晋升条目写入后 | 普通 |
-| 分funnel查询命中条目事件列表 | List[Struct(entry_id, funnel_id, hit_ts, hash_tag_list, index_bucket_id)] | ag-mem-22 L2存储单元 | L2分funnel检索命中条目后实时推送 | **高** |
-| 分funnel热度批量查询请求 | Struct(target_funnel_id, entry_id_list, stat_window:24h/7d/all, query_type:single/batch) | ag-mem-33 / ag-mem-38 | 计算C值、晋升权重时拉取热度 | **高** |
-| 全漏斗有效条目快照查询回执 | Map<funnel_id, List<entry_id>> | ag-mem-22 | 每24小时定时清理失效统计时拉取 | 普通 |
-| 全局调度/熔断指令 | Enum(暂停/恢复/全局熔断) | ag-mem-01 总控漏斗F0 | 系统紧急管控、模式切换 | **紧急** |
+| L2晋升预聚合条目快照 | List<Struct>（条目ID、funnel分槽ID、复用次数、S值、I值、向量嵌入、任务标签、创建时间） | ag-mem-22 L2近期层 | L2定时晋升扫描完成，推送待归并条目快照 | 高 |
+| 归并规则参数查询回执 | Struct（语义相似度阈值、聚合加权系数、单组最小合并条数） | ag-mem-35 三维权重配置单元 | 模块初始化、规则参数更新 | 普通 |
+| 条目元数据批量查询请求 | Struct（归并后条目ID列表） | ag-mem-37 / ag-mem-40 | 全局I值重算、遗忘批量扫描 | 高 |
+| 全局调度指令 | Enum（PAUSE/RESUME/FUSE） | ag-mem-01 总控F0 | 系统故障、模式切换、紧急熔断 | 紧急 |
 
-## 输出数据（全链路携带funnel分桶标识+哈希标签热度）
+## 输出数据
 | 输出项 | 数据类型 | 目标模块 | 输出条件 | 优先级 |
 |--------|----------|----------|----------|:---:|
-| 分funnel条目热度窗口统计包 | Struct(funnel_id, entry_hit_map:Map<entry_id, HitStat>, tag_hit_agg:Map<tag, hit_count>) | ag-mem-33、ag-mem-38 | 处理完热度查询请求 | **高** |
-| 全漏斗热度汇总状态上报 | Struct(global_total_stat_item, each_funnel_agg:Map<funnel_id, total_hit_24h/7d/all>, memory_usage) | ag-mem-03 漏斗二调度单元 | 每60秒周期性上报、状态变更时 | 普通 |
+| 归并完成标准化条目批量推送 | List<Struct>（聚合条目唯一ID、源原始条目ID集合、funnel分槽、聚合加权I、总复用、综合S、合并向量、任务标签） | ag-mem-24 L3中期存储层 | 存在可合并分组条目，过滤零散单条后下发 | 高 |
+| L2快照接收回执 | Struct（快照总条数、成功缓存条数、无价值过滤条数） | ag-mem-22 L2近期层 | 快照完整存入临时缓存 | 高 |
+| 归并后条目元数据快照 | List<聚合条目完整元数据> | ag-mem-37、ag-mem-40 | 收到元数据批量查询请求 | 高 |
+| 归并计算内存占用上报 | Struct（层级辅助单元、临时缓存KB、当前待处理条目总量） | ag-mem-48 全局容量配额 | 每60秒定时上报、大批量快照处理后即时上报 | 普通 |
+| 归并操作审计日志 | Struct（事件类型、原始条目总数、合并分组数量、过滤零散条目数量、时间戳、funnel范围） | ag-mem-51 记忆变更日志追溯单元 | 每一批快照完整归并处理完成 | 普通 |
+| 归并周期运行统计上报 | Struct（当前状态、今日处理原始条目总量、生成聚合条目总量、过滤条目总数） | ag-mem-03 漏斗二调度单元 | 每180秒周期性上报 | 普通 |
 
-## V1.1 分层统计数据结构（按funnel物理隔离）
-```
-# 顶层：按funnel隔离独立统计分区
-funnel_heat_root = {
-    "F001": {
-        index_bucket_id: "idx-F001",
-        entry_stat_map: {  # 二元主键：funnel_id+entry_id
-            "L2-F001-0001": {
-                total_hit: int,          # 全生命周期总命中
-                hit_24h: int,            # 近24小时命中
-                hit_7d: int,             # 近7天命中
-                last_hit_ts: timestamp,  # 最近一次命中时间
-                first_hit_ts: timestamp, # 首次命中时间
-                tag_hit_dist: Dict[str, int] # 本条目标签命中分布
-            }
-        },
-        global_tag_agg: Dict[str, int] # 当前funnel全局标签总命中统计
-    }
-}
-```
+## L3辅助归并核心规则（V1.1白皮书降噪聚合规范）
+### 1. 全局归并参数（由ag-mem-35统一分发）
+1. 语义相似度阈值：0.85，向量余弦相似度≥阈值判定为同类可合并；
+2. 单组合并最小条目数：≥2条才执行聚合，单一条目直接过滤不送入L3；
+3. 聚合加权计算公式：
+聚合I = (sum(单条I × 单条复用次数)) / 总复用次数
+聚合S = 算术平均分组内所有条目S值
+聚合复用次数 = 分组内所有条目复用次数累加
+聚合向量 = 分组向量加权平均（权重=复用次数）
+4. 分组匹配优先级：同funnel分槽 → 同任务标签 → 向量相似度匹配。
 
-## 配套统计约束规则
-1. **funnel数据隔离**：不同子漏斗的热度数据完全独立，禁止跨funnel聚合计数、查询；
-2. **标签热度联动更新**：条目命中时，同步累加条目自身所有hash_tag的漏斗维度全局标签计数；
-3. **内存淘汰机制**：单funnel统计内存占用超阈值时，LRU淘汰30天无命中条目统计记录；
-4. **滑动窗口近似统计**：不存储每条命中完整时间戳，仅做计数累加，上层ag-mem-33统一做时间窗口归一化；
-5. **失效清理周期**：每24小时拉取L2全漏斗有效条目快照，删除已从L2移除条目的全部热度统计；
-6. **熔断只读规则**：熔断状态下仅支持存量数据查询，禁止新增/更新命中计数、初始化新条目统计。
+### 2. 条目过滤规则（满足任意一条直接丢弃，不推送L3）
+1. 分组内条目数量＜2，无聚合价值；
+2. 单条I值低于L3准入最低阈值；
+3. 条目创建时长低于L2最小留存周期，未经过充分验证。
 
-## 核心处理逻辑（V1.1 伪代码，funnel分桶+标签热度聚合）
+### 3. 流转强制约束
+1. 唯一上游：仅接收ag-mem-22快照，拒绝其他模块输入；
+2. 单向下游：仅输出聚合条目至ag-mem-24，无任何旁路流向L4/L5；
+3. 无持久存储：所有原始快照仅内存临时缓存，处理完成立即清空，不落地持久化；
+4. 不参与遗忘/归档清理逻辑，仅做晋升预处理，无清理候选清单输出能力。
+
+### 4. 批量约束
+单次接收快照最大1000条，超量自动分片串行分组归并，防止向量相似度计算算力过载。
+
+## 核心处理逻辑
 ```
-FUNCTION l2_heat_statistics_main_loop():
-    STATE_IDLE = IDLE
-    STATE_UPDATE = UPDATING
-    STATE_RESPOND = RESPONDING
+FUNCTION l3_merge_helper_main_loop():
+    STATE_IDLE = MERGE_IDLE
+    STATE_CACHE = SNAPSHOT_CACHE
+    STATE_CALC = SEMANTIC_MERGE
+    STATE_DISPATCH = ITEM_DISPATCH
     STATE_PAUSED = SYSTEM_PAUSED
 
-    SET internal_state = STATE_IDLE
-    # 顶层分funnel独立热度根存储
-    funnel_heat_root = {}
-    last_daily_clean_ts = NOW()
+    internal_state = STATE_IDLE
+    // 加载归并全局配置
+    merge_cfg = query_merge_config(from_m35="ag-mem-35")
+    sim_threshold = merge_cfg.similarity_threshold
+    min_group_size = merge_cfg.min_merge_group
+    l3_entry_min_I = merge_cfg.L3_min_entry_I
+    temp_cache = []
+    stat_raw_total = 0
+    stat_merge_group_cnt = 0
+    stat_filter_single = 0
     last_report_ts = NOW()
 
     WHILE 系统运行中:
-        // 1. 全局熔断最高优先级拦截
-        IF 收到 ag-mem-01 全局熔断指令:
-            SET internal_state = SYSTEM_PAUSED
-            CONTINUE
-        ELSE IF 收到恢复指令 AND internal_state == SYSTEM_PAUSED:
-            SET internal_state = STATE_IDLE
-
-        // 2. 接收分funnel新条目通知，初始化空统计记录
-        IF 收到 ag-mem-22 分funnel L2新条目通知:
-            IF internal_state == SYSTEM_PAUSED:
+        // 1. 全局熔断最高优先级
+        IF 收到全局调度指令:
+            cmd = 获取调度指令
+            IF cmd == "FUSE":
+                internal_state = STATE_PAUSED
+                temp_cache.clear()
                 CONTINUE
-            target_fid = 请求.funnel_id
-            idx_bucket = 请求.index_bucket_id
-            new_entry_ids = 请求.new_entry_ids
-            entry_tags_batch = 请求.hash_tag_list
+            IF cmd == "RESUME" AND internal_state == SYSTEM_PAUSED:
+                internal_state = STATE_IDLE
 
-            // 漏斗不存在则新建独立统计分区
-            IF target_fid NOT IN funnel_heat_root:
-                funnel_heat_root[target_fid] = {
-                    index_bucket_id: idx_bucket,
-                    entry_stat_map: {},
-                    global_tag_agg: {}
-                }
-            funnel_stat = funnel_heat_root[target_fid]
+        // 2. 接收ag-mem-22预聚合快照
+        IF 收到L2晋升预聚合条目快照:
+            snapshot_data = 获取快照列表
+            internal_state = SNAPSHOT_CACHE
+            temp_cache.extend(snapshot_data)
+            cache_total = len(temp_cache)
+            stat_raw_total += len(snapshot_data)
+            // 返回快照接收回执给ag-mem-22
+            recv_ack = build_snapshot_ack(total=len(snapshot_data), cached=cache_total)
+            send_ack(target="ag-mem-22", ack_data=recv_ack)
+            internal_state = STATE_CALC
 
-            // 逐条初始化条目热度记录（命中计数初始0）
-            FOR idx, eid IN enumerate(new_entry_ids):
-                tag_list = entry_tags_batch[idx]
-                IF eid NOT IN funnel_stat.entry_stat_map:
-                    funnel_stat.entry_stat_map[eid] = {
-                        total_hit: 0,
-                        hit_24h: 0,
-                        hit_7d: 0,
-                        last_hit_ts: None,
-                        first_hit_ts: NOW(),
-                        tag_hit_dist: {t:0 for t in tag_list}
+            // 3. 语义分组归并计算
+            group_map = {}
+            filter_count = 0
+            merge_result_list = []
+            now_ts = NOW()
+            // 按funnel+任务标签初步分组
+            for item in temp_cache:
+                key = f"{item.funnel分槽ID}_{item.任务标签}"
+                if key not in group_map:
+                    group_map[key] = []
+                group_map[key].append(item)
+            // 每组内向量相似度二次细分合并
+            for group_key, item_list in group_map.items():
+                split_semantic_groups = semantic_split_by_vector(item_list, sim_threshold)
+                for semantic_group in split_semantic_groups:
+                    if len(semantic_group) < min_group_size:
+                        filter_count += len(semantic_group)
+                        stat_filter_single += len(semantic_group)
+                        continue
+                    // 加权聚合计算
+                    total_reuse = sum(i.复用次数 for i in semantic_group)
+                    weight_I_sum = sum(i.I值 * i.复用次数 for i in semantic_group)
+                    avg_S = sum(i.S值 for i in semantic_group) / len(semantic_group)
+                    avg_vector = weighted_avg_vector(semantic_group)
+                    merge_I = weight_I_sum / total_reuse
+                    // 校验L3准入I阈值
+                    if merge_I < l3_entry_min_I:
+                        filter_count += len(semantic_group)
+                        stat_filter_single += len(semantic_group)
+                        continue
+                    // 组装聚合条目
+                    source_ids = [i.条目ID for i in semantic_group]
+                    merge_item = {
+                        "merge_id": gen_uuid(),
+                        "source_item_ids": source_ids,
+                        "funnel_id": semantic_group[0].funnel分槽ID,
+                        "agg_I": merge_I,
+                        "total_reuse": total_reuse,
+                        "agg_S": avg_S,
+                        "merge_vector": avg_vector,
+                        "task_tag": semantic_group[0].任务标签
                     }
-            CONTINUE
+                    merge_result_list.append(merge_item)
+                    stat_merge_group_cnt += 1
+            temp_cache.clear()
+            internal_state = STATE_DISPATCH
 
-        // 3. 接收分funnel查询命中事件，更新条目+标签热度计数
-        IF 收到 ag-mem-22 分funnel查询命中条目事件列表:
-            IF internal_state == SYSTEM_PAUSED:
-                CONTINUE
-            SET internal_state = STATE_UPDATE
-            current_ts = NOW()
+            // 4. 批量下发聚合条目至ag-mem-24
+            if len(merge_result_list) > 0:
+                send_merge_batch(target="ag-mem-24", item_list=merge_result_list)
+            // 写入归并审计日志
+            audit_log = build_merge_audit(
+                raw_count=len(snapshot_data),
+                merge_group=stat_merge_group_cnt,
+                filter_num=filter_count,
+                ts=now_ts
+            )
+            send_audit_log(target="ag-mem-51", log_data=audit_log)
+            internal_state = STATE_IDLE
 
-            FOR hit_item IN 请求.命中条目列表:
-                eid = hit_item.entry_id
-                fid = hit_item.funnel_id
-                hit_tags = hit_item.hash_tag_list
-                idx_bucket = hit_item.index_bucket_id
+        // 5. 处理元数据批量查询
+        IF 收到条目元数据批量查询请求:
+            query_ids = 获取聚合条目ID列表
+            meta_snap = query_merge_item_meta(query_ids)
+            send_meta_snapshot(target="ag-mem-37", meta_list=meta_snap)
+            send_meta_snapshot(target="ag-mem-40", meta_list=meta_snap)
 
-                // 校验漏斗合法性，不存在则初始化分区
-                IF fid NOT IN funnel_heat_root:
-                    funnel_heat_root[fid] = {
-                        index_bucket_id: idx_bucket,
-                        entry_stat_map: {},
-                        global_tag_agg: {}
-                    }
-                funnel_stat = funnel_heat_root[fid]
-
-                // 条目无记录则自动初始化
-                IF eid NOT IN funnel_stat.entry_stat_map:
-                    funnel_stat.entry_stat_map[eid] = {
-                        total_hit: 0,
-                        hit_24h: 0,
-                        hit_7d: 0,
-                        last_hit_ts: None,
-                        first_hit_ts: current_ts,
-                        tag_hit_dist: {t:0 for t in hit_tags}
-                    }
-                entry_stat = funnel_stat.entry_stat_map[eid]
-
-                // 更新条目维度命中计数
-                entry_stat.total_hit += 1
-                entry_stat.hit_24h += 1
-                entry_stat.hit_7d += 1
-                entry_stat.last_hit_ts = current_ts
-
-                // 更新本条目标签分布计数
-                FOR tag in hit_tags:
-                    entry_stat.tag_hit_dist[tag] += 1
-                    // 更新漏斗全局标签总热度
-                    funnel_stat.global_tag_agg[tag] = funnel_stat.global_tag_agg.get(tag, 0) + 1
-
-            SET internal_state = STATE_IDLE
-
-        // 4. 响应分funnel批量热度查询请求
-        IF 收到分funnel热度批量查询请求:
-            SET internal_state = RESPONDING
-            target_fid = 请求.target_funnel_id
-            query_entry_list = 请求.entry_id_list
-            stat_window = 请求.stat_window
-            query_result = {
-                funnel_id: target_fid,
-                entry_hit_map: {},
-                tag_hit_agg: {}
-            }
-
-            // 漏斗无统计分区，返回全0空数据
-            IF target_fid NOT IN funnel_heat_root:
-                FOR eid in query_entry_list:
-                    query_result["entry_hit_map"][eid] = {
-                        total_hit:0, hit_24h:0, hit_7d:0, last_hit_ts:None
-                    }
-                向请求方返回分funnel条目热度窗口统计包(query_result)
-                SET internal_state = IDLE
-                CONTINUE
-
-            funnel_stat = funnel_heat_root[target_fid]
-            query_result["tag_hit_agg"] = funnel_stat.global_tag_agg
-
-            // 按窗口筛选返回计数
-            FOR eid in query_entry_list:
-                IF eid in funnel_stat.entry_stat_map:
-                    raw = funnel_stat.entry_stat_map[eid]
-                    if stat_window == "24h":
-                        hit_data = {"total_hit":raw.hit_24h, "hit_window":raw.hit_24h, "last_hit_ts":raw.last_hit_ts}
-                    elif stat_window == "7d":
-                        hit_data = {"total_hit":raw.hit_7d, "hit_window":raw.hit_7d, "last_hit_ts":raw.last_hit_ts}
-                    else:
-                        hit_data = {"total_hit":raw.total_hit, "hit_window":raw.total_hit, "last_hit_ts":raw.last_hit_ts}
-                    query_result["entry_hit_map"][eid] = hit_data
-                ELSE:
-                    query_result["entry_hit_map"][eid] = {"total_hit":0, "hit_window":0, "last_hit_ts":None}
-
-            // 输出热度统计包至ag-mem-33/ag-mem-38
-            向请求来源模块返回分funnel条目热度窗口统计包(query_result)
-            SET internal_state = IDLE
-
-        // 5. 每24小时定时清理已删除条目统计记录
-        IF (NOW() - last_daily_clean_ts) >= 86400:
-            // 拉取L2全漏斗有效条目快照
-            valid_funnel_entry_map = ag-mem-22.query_all_l2_valid_entries()
-            // 遍历本地所有funnel统计分区
-            for fid in list(funnel_heat_root.keys()):
-                local_entry_set = set(funnel_heat_root[fid]["entry_stat_map"].keys())
-                valid_entry_set = set(valid_funnel_entry_map.get(fid, []))
-                // 找出已失效条目，批量删除统计
-                del_eids = local_entry_set - valid_entry_set
-                for eid in del_eids:
-                    del funnel_heat_root[fid]["entry_stat_map"][eid]
-            last_daily_clean_ts = NOW()
-
-        // 6. 每60秒周期性全漏斗热度汇总上报至ag-mem-03
-        IF (NOW() - last_report_ts) >= 60:
-            global_total_items = 0
-            each_funnel_agg = {}
-            for fid, stat in funnel_heat_root.items():
-                entry_count = len(stat["entry_stat_map"])
-                global_total_items += entry_count
-                sum_24h = sum([v["hit_24h"] for v in stat["entry_stat_map"].values()])
-                sum_7d = sum([v["hit_7d"] for v in stat["entry_stat_map"].values()])
-                sum_all = sum([v["total_hit"] for v in stat["entry_stat_map"].values()])
-                each_funnel_agg[fid] = {
-                    stat_item_count: entry_count,
-                    total_hit_24h: sum_24h,
-                    total_hit_7d: sum_7d,
-                    total_hit_all: sum_all
-                }
-            report_pkg = {
-                current_state: internal_state,
-                global_total_stat_item: global_total_items,
-                each_funnel_agg: each_funnel_agg
-            }
-            向 ag-mem-03 发送全漏斗热度汇总状态上报(report_pkg)
+        // 6. 定时容量上报与周期统计上报
+        IF NOW() - last_report_ts >= 60 * 1000:
+            cache_kb = calc_temp_cache_kb(temp_cache, merge_cfg.avg_item_kb)
+            cap_report = build_cap_report(layer="ag-mem-23", used_kb=cache_kb, item_count=len(temp_cache))
+            send_cap_report(target="ag-mem-48", report=cap_report)
+            // 180s周期统计上报
+            IF NOW() - last_report_ts >= 180 * 1000:
+                stat_report = build_merge_stat_report(
+                    state=internal_state,
+                    total_raw=stat_raw_total,
+                    total_merge_group=stat_merge_group_cnt,
+                    total_filter=stat_filter_single
+                )
+                send_stat_report(target="ag-mem-03", report=stat_report)
             last_report_ts = NOW()
 
-        SLEEP 20ms
+        SLEEP 10ms
 ```
 
-## 约束与异常处理（V1.1新增funnel、哈希索引相关异常）
+## 约束与异常处理
 | 场景 | 处理方式 | 恢复条件 |
 |------|----------|----------|
-| 命中事件携带未注册funnel_id | 自动新建该funnel独立统计分区，正常初始化条目热度 | ag-mem-14完成漏斗注册同步至总控注册表 |
-| 批量查询目标funnel不存在 | 返回该漏斗下所有条目命中计数全为0的空统计包 | 对应funnel产生L2写入事件初始化分区 |
-| 单funnel热度统计内存占用超阈值 | LRU自动淘汰30天无任何命中的条目统计记录，释放内存 | 内存使用率回落至安全阈值 |
-| 24小时清理周期拉取L2有效条目快照超时 | 跳过本次清理，保留全部存量热度统计，等待次日周期 | ag-mem-22存储服务恢复正常 |
-| 全局系统熔断触发 | 停止所有新增条目初始化、命中计数更新；仅开放存量数据查询 | ag-mem-01下发恢复指令 |
-| 命中条目hash_tag_list为空 | 正常更新条目总命中计数，不更新漏斗全局标签热度聚合 | 上层路由模块补全领域哈希标签后新写入条目 |
+| L2快照条目向量缺失、参数非法 | 本条直接过滤不计入分组，不参与归并，日志标记异常 | ag-mem-22重新推送完整向量数据快照 |
+| 单次快照超过1000条上限 | 自动分片分批加载、分组计算，串行处理不阻塞主线程 | 内置分片逻辑自动执行 |
+| 向量相似度计算算力超时 | 当前分组全部过滤，记录告警，下一轮快照重新处理 | 系统算力负载降低后正常执行归并 |
+| 临时内存缓存溢出 | 截断后半部分快照存入缓存，溢出条目丢弃并告警 | 降低单次L2推送快照条数，或扩容内存资源 |
+| 全局FUSE熔断触发 | 清空全部临时缓存，终止当前归并计算，拒绝新快照接收 | ag-mem-01下发RESUME恢复指令 |
+| 分funnel无专属归并阈值配置 | 加载全局通用相似度、最小分组参数兜底计算 | ag-mem-35补充分funnel独立归并规则 |
 
-## 总线契约（废弃固定分槽编号，统一funnel/index_bucket/hash_tag传输）
+## 总线契约
 | 总线 | 操作 | 数据内容 | 权限 | 说明 |
 |------|------|----------|------|------|
-| 内部调度总线 | 读 | 分funnel L2新条目通知（funnel_id/index_bucket/hash_tag_list） | 只读 | ag-mem-22 发送 |
-| 内部调度总线 | 读 | 分funnel查询命中条目事件列表（携带完整索引标签字段） | 只读 | ag-mem-22 实时推送 |
-| 内部调度总线 | 读 | 分funnel热度批量查询请求（指定target_funnel_id、统计窗口） | 只读 | ag-mem-33 / ag-mem-38 发送 |
-| 内部调度总线 | 读 | ag-mem-01全局熔断/恢复调度指令 | 只读 | 顶层总控下发管控信号 |
-| 内部调度总线 | 写 | 分funnel条目热度窗口统计包（条目计数+漏斗标签聚合热度） | 专属写入 | 向 ag-mem-33、ag-mem-38 返回 |
-| 内部调度总线 | 写 | 全漏斗热度汇总状态上报（各funnel聚合指标） | 周期性写入 | 向 ag-mem-03 漏斗二调度单元上报 |
+| 内部调度总线 | 读 | L2预聚合条目快照 | 只读 | ag-mem-22 唯一上游输入 |
+| 内部调度总线 | 读 | 归并规则配置回执 | 只读 | ag-mem-35 |
+| 内部调度总线 | 读 | 元数据批量查询、全局熔断指令 | 只读 | ag-mem-37/40、ag-mem-01 |
+| 内部调度总线 | 写 | 快照接收回执 | 专属写入 | 返回上游 ag-mem-22 |
+| 内部调度总线 | 写 | 归并完成条目批量推送 | 专属写入 | 下发下游 ag-mem-24 |
+| 内部调度总线 | 写 | 元数据快照、容量上报、审计日志、周期统计 | 事件/周期写入 | ag-mem-37/40、ag-mem-48、ag-mem-51、ag-mem-03 |
 
-## 安全边界（V1.1新增动态漏斗、哈希索引隔离约束）
+## 安全边界（V1.1强制规范）
 | 规则编号 | 内容 |
 |:---:|------|
-| S-01 | 热度统计仅存储元数据（命中次数、时间戳、标签计数），全程不读取、缓存、持久化任何原始经验正文内容 |
-| S-02 | 严格按funnel_id做数据物理隔离，禁止跨漏斗读取、聚合、修改热度统计数据，保证领域数据隔离 |
-| S-03 | 所有统计数据仅驻留内存，无持久化落地；系统重启后全量热度统计清零，重新积累 |
-| S-04 | 本模块仅被动接收ag-mem-22推送事件，禁止主动反向查询L2存储条目正文，仅定时拉取条目ID快照用于失效清理 |
-| S-05 | 哈希标签热度仅用于漏斗内部检索权重参考，禁止将标签聚合数据直接对外输出至ECC上层认知模块 |
-| S-06 | 全局熔断状态下禁止新增任何条目统计、更新命中计数，仅允许存量热度数据只读查询 |
-| S-07 | 不存在于ag-mem-01全局注册表的funnel_id仅做临时统计，上报时标记异常漏斗ID用于告警监控 |
+| M-01 | 仅接收ag-mem-22输出快照，禁止其他存储/调度模块直接推送条目，阻断非法记忆流入L3 |
+| M-02 | 归并计算仅单向输出至ag-mem-24，无任何跨层直达L4/L5的流转通道，分层链路隔离 |
+| M-03 | 无持久化存储设计，原始快照仅内存临时缓存，处理完毕立即清空，减少数据泄露风险 |
+| M-04 | 相似度阈值、合并最小条数、准入I阈值全部由ag-mem-35集中管控，本地无硬编码参数 |
+| M-05 | 所有分组合并、条目过滤操作全量写入ag-mem-51审计日志，留存原始条目ID与聚合映射关系，支持溯源 |
+| M-06 | 熔断状态自动清空临时缓存，避免内存堆积占用资源，恢复后等待L2重新下发快照 |
 
-## 接口校验用例（适配funnel分桶、哈希标签热度统计）
+## 接口校验用例
 | 用例编号 | 前置条件 | 输入 | 预期输出 |
 |----------|----------|------|----------|
-| TC-M23-01 | `IDLE`，funnel=F003分区未初始化 | 分funnel新条目通知（3条，hash_tag=["Java","多线程"]） | 新建F003独立统计分区，3条条目初始化命中计数全0，绑定对应index_bucket |
-| TC-M23-02 | `IDLE`，funnel=F005存在存量条目 | 5条命中事件，携带hash_tag=["接口自动化"] | 5条条目总命中/24h/7d计数+1，同步累加F005全局标签热度 |
-| TC-M23-03 | `IDLE`，查询请求指定funnel=F002，窗口=7d | 批量条目ID热度查询 | 返回F002专属统计包，包含条目7天命中计数+该漏斗全部标签聚合热度 |
-| TC-M23-04 | `IDLE`，命中事件携带未注册funnel=F999 | 未知funnel命中条目列表 | 自动新建F999统计分区，正常更新命中计数，上报时标记异常漏斗 |
-| TC-M23-05 | `IDLE`，24小时定时清理触发，F001内2条条目已从L2删除 | 拉取L2有效条目快照 | 从F001 entry_stat_map中移除2条失效条目全部统计记录 |
-| TC-M23-06 | `SYSTEM_PAUSED`，收到新条目通知/命中事件 | 任意funnel热度更新事件 | 直接丢弃更新请求，存量数据可正常查询 |
-| TC-M23-07 | `NORMAL`，命中条目hash_tag_list为空 | 单条无标签命中事件 | 条目命中计数正常累加，不更新漏斗全局标签聚合热度 |
+| TC-M23-01 | `MERGE_IDLE`，ag-mem-22推送同funnel同标签、相似度0.9的3条条目快照 | L2预聚合快照 | 自动分组加权聚合，生成单条聚合条目推送ag-mem-24，输出归并审计日志 |
+| TC-M23-02 | `MERGE_IDLE`，快照内仅单条独立条目 | 单一条目快照 | 判定无聚合价值，直接过滤，统计过滤计数+1 |
+| TC-M23-03 | `MERGE_IDLE`，分组聚合后I值低于L3准入阈值 | 多条同类快照 | 整组过滤，不推送至ag-mem-24 |
+| TC-M23-04 | `MERGE_IDLE`，单次快照1200条条目 | 超大批量快照 | 自动分片串行分组归并，完整处理无内存溢出 |
+| TC-M23-05 | `MERGE_IDLE`，ag-mem-37下发聚合条目ID查询 | 元数据批量查询请求 | 返回聚合条目完整加权元数据快照 |
+| TC-M23-06 | `MERGE_IDLE`，接收全局FUSE熔断指令 | 紧急熔断调度指令 | 切换SYSTEM_PAUSED，清空临时缓存，停止快照处理与归并计算 |
 
-## 质量自检清单（V1.1完整达标）
+## 质量自检清单
 | 检查项 | 状态 |
 |--------|:---:|
-| 模块编号、五层存储分区归属不变，彻底移除V1.0固定分槽编号逻辑 | ✅ |
-| 新增依赖ag-mem-01总控F0，用于接收全局熔断、校验漏斗合法性 | ✅ |
-| 原有4种运行状态完整保留，所有统计逻辑按funnel分桶隔离改造 | ✅ |
-| 输入输出全部携带funnel_id、index_bucket_id、hash_tag_list分桶索引字段 | ✅ |
-| 重构统计存储结构，顶层按funnel分区，内置条目计数+标签全局热度双层统计 | ✅ |
-| 伪代码完整实现新条目初始化、命中计数更新、标签热度聚合、批量查询、每日失效清理、周期上报全流程 | ✅ |
-| 异常处理覆盖未知funnel、内存淘汰、快照拉取超时、熔断、空标签条目等新增场景 | ✅ |
-| 总线契约全部移除旧分槽传输字段，统一funnel/索引桶/哈希标签传输规范 | ✅ |
-| 安全边界新增funnel物理隔离、标签数据隔离、熔断只读约束 | ✅ |
-| 校验用例覆盖分区初始化、命中计数更新、分funnel查询、未知漏斗、定时清理、熔断、空标签全场景 | ✅ |
-| 完全对齐V1.1动态子漏斗、分桶哈希索引MLNF-Mem五层统一架构标准 | ✅ |
+| 模块编号ag-mem-23匹配白皮书L2→L3中间归并辅助单元定位 | ✅ |
+| 上游仅ag-mem-22、下游仅ag-mem-24，数据流闭环无冲突 | ✅ |
+| 5种内部状态切换逻辑清晰，覆盖缓存、计算、下发全流程 | ✅ |
+| 输入输出完整标注收发模块、结构体、优先级，链路无错乱 | ✅ |
+| 语义相似度分组、加权聚合公式、过滤规则严格对齐V1.1降噪设计 | ✅ |
+| 伪代码覆盖快照接收、分组拆分、加权计算、过滤、批量下发、日志、容量上报全链路 | ✅ |
+| 异常场景覆盖向量缺失、超大批次、算力超时、缓存溢出、熔断、无分槽规则共6类 | ✅ |
+| 总线读写权限隔离，仅允许L2推送原始快照 | ✅ |
+| 6条安全约束杜绝旁路写入、跨层流转、数据留存风险 | ✅ |
+| 6条测试用例覆盖全部核心业务场景 | ✅ |
 
 ---
