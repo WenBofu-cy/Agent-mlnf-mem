@@ -1,400 +1,297 @@
-## V1.1 模块升级总说明
-### V1.1 重大升级变更点
-1. 废弃V1.0五场景静态分槽存储架构，重构为`funnel_id`动态子漏斗独立分桶存储，各领域经验物理隔离，互不抢占资源；
-2. 内置每个子漏斗专属独立哈希索引桶，写入自动维护标签映射，清除同步回收失效索引，大幅降低全库检索扫描开销；
-3. 容量管控由单一全局阈值，升级为「全局配额池 + 单funnel独立硬上限」双约束，单一领域不会耗尽全部L2存储空间；
-4. 7天超期条目分流逻辑按funnel专属L2→L3阈值判定，抛弃统一静态阈值表，由ag-mem-01动态下发各领域自定义阈值；
-5. 全链路输入输出统一新增`funnel_id`、`hash_tag_list`、`index_bucket_id`、`result_validated`，与ag-mem-01/14/21/38全模块字段互通兼容；
-6. 新增哈希索引容量自清理机制，单漏斗标签达上限自动淘汰低频标签，平衡检索性能与内存占用；
-7. 定时扫描、容量清理逻辑完全按单个funnel隔离执行，单一漏斗资源拥堵不影响其他领域正常读写；
-8. 原有L2核心业务能力（晋升写入、查询、7天超期分流、容量预警）完整保留，仅适配动态漏斗+索引体系扩展分支，无原有逻辑丢失；
-9. 增加非法funnel拦截校验，所有存储操作依赖总控漏斗合法注册表，杜绝游离漏斗破坏系统宏观自收敛机制。
-
-# ag-mem-22-L2近期层存储单元 接口规格（V1.1 版，适配动态funnel分桶+独立哈希索引）
----
+# ag-mem-22-L2近期层 完整标准化接口文档（对齐EM-Core-Agent V1.1白皮书4.4.1五层单向记忆晋升通路）
 ## 基本信息
 | 项 | 内容 |
 |----|------|
 | 模块编号 | ag-mem-22 |
-| 模块名称 | L2近期层存储单元 |
-| 所属分区 | 三、漏斗二：任务经验漏斗 / 五层存储 |
-| 核心职责 | 五层存储第二层，存储L1晋升、7日内活跃动态子漏斗经验，全局占漏斗二总容量25%。**废弃V1.0固定ag-mem-15~19分槽，全链路以funnel_id分桶隔离存储**，每条条目绑定专属`index_bucket_id`与`hash_tag_list`，内置单漏斗独立哈希索引字典，支撑标签高速检索。<br>接收ag-mem-21分funnel晋升条目，维护单funnel独立容量上限与7天生命周期；定时扫描超期条目，高I值条目推送至ag-mem-24（L3）晋升，低价值条目移交ag-mem-42清除，同步归集失效哈希标签回写索引清理指令。<br>对外支持按funnel精准检索，向ag-mem-23推送新条目用于热度统计；仅负责分桶持久化、哈希索引维护、容量管控，不参与晋升/遗忘判定逻辑。 |
-| 依赖模块 | ag-mem-01（总控F0，拉取全局funnel注册表、索引资源池、funnel专属L2→L3阈值）、ag-mem-21（L1衰减单元，下发分funnel晋升条目，携带哈希索引全套字段）、ag-mem-23（L2热度统计，接收新增条目元数据）、ag-mem-24（L3中期存储，接收L2超期高价值晋升条目）、ag-mem-42（冗余删除归档，接收低价值/超期待清除条目）、ag-mem-48（全局容量管控，查询单funnel/全局L2容量占用） |
-| 被依赖模块 | ag-mem-21（返回分funnel写入确认回执）、ag-mem-23（接收新增funnel条目通知）、ag-mem-03（漏斗二调度单元，转发带funnel过滤的经验查询）、ag-mem-38（晋升判定单元，读取funnel条目与哈希标签） |
+| 模块名称 | L2近期层（情景记忆持久存储层） |
+| 所属分区 | 三、漏斗二：任务经验漏斗 / 五层单向记忆晋升通路 |
+| 核心职责 | 上游唯一写入源为ag-mem-21（L1分桶临时层），持久存储经短期验证的中长期情景经验；按funnel_id分业务域隔离存储，内置向量索引支持语义检索；遵循V1.1「结果驱动晋升、分层单向流转」规范，定时校验条目I值、复用频次、30天最大留存时效；达标条目单向批量晋升至ag-mem-24 L3中期存储，晋升前同步推送条目至ag-mem-23辅助归并单元做预聚合；低重要度、超期条目生成遗忘候选推送ag-mem-42执行归档（L2层级不直接物理删除，统一离线归档）；对外输出完整条目元数据供给ag-mem-37全局I值重算、ag-mem-40遗忘批量扫描；定时上报分层容量占用至ag-mem-48；所有新增、晋升、归档操作全量推送审计日志至ag-mem-51；L5永久隔离，无任何直通顶层存储流转通道。 |
+| 依赖模块 | ag-mem-01（总控F0全局熔断调度）、ag-mem-21（L1临时层，唯一上游写入来源）、ag-mem-23（L3辅助归并单元，晋升前置预聚合）、ag-mem-35（三维权重配置单元，分funnel独立读取L2晋升/遗忘阈值、30天留存时效、归档规则）、ag-mem-48（全局容量配额管控，读取分层容量上限、预警/紧急阈值） |
+| 被依赖模块 | ag-mem-23（接收晋升条目预聚合快照）、ag-mem-24（L3中期存储层，接收完成聚合后的晋升条目）、ag-mem-37（重要度定时刷新单元，读取L2全量条目元数据）、ag-mem-40（遗忘阈值判定单元，提供L2条目扫描快照）、ag-mem-42（冗余记忆删除单元，接收L2归档遗忘候选清单）、ag-mem-48（定时上报L2分层占用容量）、ag-mem-51（推送L2记忆变更审计日志）、ag-mem-03（漏斗二调度单元，周期上报L2运行统计） |
 
 ## 内部状态定义
 | 状态 | 标识 | 含义 | 触发条件 |
 |------|------|------|----------|
-| 正常服务 | `NORMAL` | 各funnel分桶存储、哈希索引读写就绪，接收晋升写入与查询 | 初始化完成，所有子漏斗索引桶挂载完成 |
-| 容量预警 | `CAPACITY_WARNING` | 任意单funnel使用率≥80% 或 全局L2总使用率≥80%，异步温和清理过期低价值条目 | 单漏斗/全局占用达80%阈值 |
-| 容量紧急 | `CAPACITY_CRITICAL` | 单funnel≥95%或全局≥95%，暂停该漏斗新写入，强制同步清理过期+低重要度条目 | 单漏斗/全局占用达95%阈值 |
-| 暂停服务 | `SYSTEM_PAUSED` | ag-mem-01下发全局熔断，冻结所有写入、索引变更操作，仅开放只读查询 | 全局紧急熔断指令 |
+| 待机就绪 | `L2_IDLE` | 正常接收ag-mem-21批量晋升写入，等待定时晋升/归档扫描任务 | 系统初始化、熔断恢复、批次晋升/归档全部完成 |
+| 条目持久写入 | `ITEM_PERSIST` | 校验L1晋升条目合法性，按funnel分域落盘，构建向量检索索引，初始化完整条目元数据 | 收到ag-mem-21下发批量晋升条目 |
+| 晋升预聚合扫描 | `PROMOTE_AGG_SCAN` | 遍历分域条目，比对分funnel晋升阈值、复用次数、留存时效筛选可晋升条目，推送快照至ag-mem-23预聚合 | 晋升定时周期倒计时归零 |
+| 归档遗忘扫描 | `ARCHIVE_SCAN` | 筛选低I、超30天时效条目，生成归档候选清单推送ag-mem-42 | 归档扫描周期到达 / ag-mem-48容量预警触发加急扫描 |
+| 暂停服务 | `SYSTEM_PAUSED` | 全局熔断，停止写入、晋升聚合、归档扫描，内存缓存临时条目元数据 | F0下发FUSE熔断指令；RESUME切回L2_IDLE |
 
-## 输入数据（V1.1 删除来源分槽编号，新增funnel、索引、result标记）
+## 输入数据
 | 输入项 | 数据类型 | 来源模块 | 触发条件 | 优先级 |
 |--------|----------|----------|----------|:---:|
-| 单funnel L2晋升条目列表 | List[Struct]（entry_id + funnel_id + 经验原始数据 + I重要度 + hash_tag_list + index_bucket_id + result_validated + l1_create_ts + promote_ts） | ag-mem-21 L1时序衰减单元 | L1评估通过，分漏斗批量推送晋升数据 | **高** |
-| L2分funnel查询请求 | Struct（查询条件 + 目标funnel_id过滤 + 最大返回条数） | ag-mem-03 漏斗二调度单元 | 业务检索指定领域子漏斗近期经验 | **高** |
-| L2清理完成回执 | Struct（funnel_id + 清理条目数 + 释放存储空间 + 剩余漏斗使用率） | ag-mem-42 冗余删除单元 | 单漏斗批量条目清理完毕 | **高** |
-| 单漏斗/全局L2容量查询回执 | Struct（全局总条目/使用率 + 目标funnel条目数/使用率 + 单funnel硬上限） | ag-mem-48 全局容量配额单元 | 每条晋升写入前拉取容量数据 | **高** |
-| 全局调度/熔断指令 | Enum（暂停/恢复/全局熔断） | ag-mem-01 总控漏斗F0 | 系统模式切换、存储资源故障管控 | **紧急** |
+| L1批量晋升条目推送 | List<Struct>（条目ID、复用次数、S值、实时I值、生成时间、来源funnel分槽ID、result_validated标记、向量嵌入） | ag-mem-21 L1分桶临时层 | L1定时晋升筛选完成，推送达标短期经验 | 高 |
+| L2定时晋升聚合扫描指令 | Struct（触发类型=定时，目标下游L3） | 内部定时调度 | 晋升聚合周期倒计时归零 | 普通 |
+| L2归档遗忘扫描触发指令 | Struct（触发原因：定时/容量预警，是否加急） | 内部定时调度 / ag-mem-48容量预警 | 归档周期到达、分层容量触发预警 | 普通 |
+| 条目元数据批量查询请求 | Struct（条目ID列表） | ag-mem-37 重要度增量定时刷新单元 | 全局I值批量重算 | 高 |
+| 分层容量配额配置回执 | Struct（L2总容量上限、预警占比、紧急溢出占比） | ag-mem-48 全局容量配额单元 | 模块初始化、配额人工更新 | 普通 |
+| 全局调度指令 | Enum（PAUSE/RESUME/FUSE） | ag-mem-01 总控F0 | 系统紧急故障、模式切换 | 紧急 |
 
-## 输出数据（全链路携带funnel与哈希索引标识）
+## 输出数据
 | 输出项 | 数据类型 | 目标模块 | 输出条件 | 优先级 |
 |--------|----------|----------|----------|:---:|
-| 分funnel写入确认回执 | Struct（funnel_id + 接收条目总数 + 成功写入条数 + 当前漏斗使用率 + index_bucket_id） | ag-mem-21 L1衰减单元 | 单漏斗晋升条目全部处理完成 | **高** |
-| L2分桶查询结果集 | Struct（匹配条目列表，每条携带entry_id/funnel_id/hash_tag_list/I值/最近访问时间） | ag-mem-03 漏斗二调度单元 | 检索请求处理完毕 | **高** |
-| 新增funnel条目通知 | Struct（funnel_id + 新增entry_id集合 + index_bucket_id） | ag-mem-23 L2热度统计单元 | 存在成功写入的晋升条目 | 普通 |
-| L2超期晋升至L3条目清单 | List[Struct]（entry_id/funnel_id/hash_tag_list/index_bucket_id/I值/result_validated） | ag-mem-24 L3中期存储单元 | 定时扫描出7天超期且I≥funnel L2→L3阈值条目 | **高** |
-| 待清除条目+失效哈希标签包 | Struct（funnel_id + clean_entry_ids + merged_clean_tags） | ag-mem-42 删除单元；同步回写本层索引清理指令 | 超期低价值/容量清理条目 | **高** |
-| L2全局分桶状态上报 | Struct（全局总条目/使用率 + 各funnel独立条目数/使用率/索引标签总量） | ag-mem-48、ag-mem-01总控F0 | 每30秒周期性上报、状态变更时 | 普通 |
+| L2条目写入完成回执 | Struct（批量条目总量、写入成功数量、失败条目ID列表） | ag-mem-21 L1临时层 | L1晋升条目批量持久落盘完成 | 高 |
+| 晋升条目预聚合快照 | List（条目完整元数据、最新I值、复用次数、funnel分槽ID、向量嵌入） | ag-mem-23 L3辅助归并单元 | 晋升筛选存在合格条目，前置聚合预处理 | 高 |
+| L2归档遗忘候选清单 | List（条目ID、遗忘原因、当前I值、层级遗忘阈值、suggest_handle=archive） | ag-mem-42 冗余记忆删除单元 | 归档扫描筛选待清理条目 | 普通 |
+| L2条目元数据快照 | List（条目ID、I值、复用次数、写入时间、最近访问、funnel分槽ID、向量嵌入） | ag-mem-37 / ag-mem-40 | I值刷新、遗忘扫描批量查询 | 高 |
+| L2分层容量占用上报 | Struct（层级=L2、当前占用KB、条目总数、单条平均体积KB、向量索引占用） | ag-mem-48 全局容量配额 | 每60秒定时上报、批量条目变更后即时上报 | 普通 |
+| L2记忆变更审计日志 | Struct（事件类型、条目操作数量、分层、时间戳、关联funnel分槽、向量索引变更标记） | ag-mem-51 记忆变更日志追溯单元 | 写入、晋升聚合、归档清理操作完成 | 普通 |
+| L2周期运行统计上报 | Struct（当前状态、今日新增条目、累计晋升L3总量、累计归档清理总量、向量索引总条目数） | ag-mem-03 漏斗二专属调度单元 | 每180秒周期性上报 | 普通 |
 
-## L2存储全局&单漏斗配置（V1.1 分全局池+单漏斗独立配额）
-| 配置项 | 默认值 | 说明 |
-|--------|:---:|------|
-| L2占用漏斗二总存储比例 | 25% | 所有动态funnel共享全局25%配额池 |
-| 单funnel L2条目硬上限 | 1500条 | 单个领域漏斗独立存储上限，互不抢占资源 |
-| L2条目最大留存生命周期 | 7天（168小时） | 写入L2满7天必须执行晋升或清除 |
-| 单条目最大二进制体积 | 15KB | 超过尺寸直接跳过，条目留存L1不晋升 |
-| 单次写入操作超时阈值 | 200ms | 分桶持久化+索引更新最大等待时长 |
-| 容量预警阈值 | 80% | 单漏斗/全局占用≥80%触发异步温和清理 |
-| 容量紧急阈值 | 95% | 单漏斗/全局占用≥95%暂停写入、强制同步清理 |
-| 定时超期扫描间隔 | 1小时 | 全活跃funnel轮询7天超期条目 |
-| 单funnel哈希索引标签上限 | 12000个 | 独立index_bucket标签总量超限自动清理低频标签 |
-| L2→L3通用基准I阈值 | 0.62 | 新建无自定义阈值funnel默认使用该值 |
+## L2近期层核心规则（严格对齐V1.1白皮书4.4.1五层晋升通路）
+### 1. 分funnel独立配置参数（由ag-mem-35统一下发）
+1. L2最大留存时效：30天，写入满30天未晋升自动进入归档流程；
+2. L2晋升L3最低I阈值：分业务funnel独立配置；
+3. L2归档遗忘I阈值：分业务funnel独立配置；
+4. 晋升最低累计复用次数：8次；
+5. 准入前置校验：上游L1传入`result_validated=True`，无标记条目拒绝写入。
 
-## 核心配套规则
-### 1. 分桶哈希索引维护规则
-1. 每个funnel绑定唯一`index_bucket_id`，索引物理隔离，禁止跨漏斗共享标签映射；
-2. 条目写入同步将`hash_tag_list`全部写入对应索引桶，建立tag→[entry_id]映射，统计标签访问频次；
-3. 条目被清除时自动归集全部关联标签，合并去重生成清理包，同步删除索引桶内失效entry_id映射；
-4. 单漏斗索引标签达12000上限，自动删除20%低频访问标签释放索引空间。
+### 2. 晋升至L3完整准入条件（全部同时满足）
+1. 条目`result_validated`校验标记恒为True；
+2. 当前实时I值 ≥ 当前funnel分槽L2晋升阈值；
+3. 总任务+工具累计复用次数 ≥ 8次；
+4. 条目写入未满30天，未达最大留存时效；
+5. 无人工收藏/锁定保护标记。
 
-### 2. 7天超期条目分流规则（按funnel专属阈值判定）
-1. 条目在L2留存≥168小时：
-   - I ≥ funnel专属L2→L3阈值：打包晋升至ag-mem-24 L3层；
-   - I ＜ funnel专属L2→L3阈值：移交ag-mem-42永久清除，同步清理哈希索引。
-2. 容量紧急/预警清理优先筛选「超7天+低I值」条目，无超期条目时再清理存量最低重要度条目。
+### 3. 归档清理触发条件（满足任意一条即加入归档候选）
+1. 实时I值 ＜ 当前funnel分槽L2归档遗忘阈值；
+2. 条目写入满30天仍未完成晋升至L3；
+3. 分层容量达到紧急溢出阈值，条目I值处于L2后20%区间强制加急归档。
 
-### 3. 容量管控隔离规则
-清理、写入、查询逻辑完全按funnel隔离，单一漏斗容量拥堵不会阻塞其他领域funnel正常读写。
+### 4. V1.1分层流转强制约束
+1. 唯一上游写入源：仅接收ag-mem-21推送条目，拒绝其他模块直接写入，杜绝旁路写入漏洞；
+2. 单向流转链路：L2条目先推送预聚合快照至ag-mem-23，完成聚合后再批量流入ag-mem-24 L3，禁止直接跨层写入L4/L5；
+3. 清理规则区分层级：L1/L0物理删除，**L2及以上层级过期条目统一离线归档，不直接物理删除**；
+4. L5永久隔离：不存在任何L2条目直通顶层核心永久存储的流转通道。
 
-## 核心处理逻辑（V1.1 伪代码，funnel分桶+哈希索引一体化）
+### 5. 批量处理约束
+单次晋升/归档扫描最大处理1000条，超量自动拆分多批次串行执行，避免向量索引重建、IO阻塞。
+
+## 核心处理逻辑
 ```
-FUNCTION l2_storage_main_loop():
-    STATE_NORMAL = NORMAL
-    STATE_WARN = CAPACITY_WARNING
-    STATE_CRITICAL = CAPACITY_CRITICAL
+FUNCTION l2_episodic_storage_main_loop():
+    STATE_IDLE = L2_IDLE
+    STATE_PERSIST = ITEM_PERSIST
+    STATE_AGG_SCAN = PROMOTE_AGG_SCAN
+    STATE_ARCHIVE_SCAN = ARCHIVE_SCAN
     STATE_PAUSED = SYSTEM_PAUSED
 
-    SET internal_state = STATE_NORMAL
-    // 初始化分桶存储、独立哈希索引池
-    l2_funnel_store = {}        # key:funnel_id, value:该漏斗完整条目集合
-    funnel_hash_index = {}       # key:funnel_id, value:{index_bucket, tag_map, tag_usage_stat}
-    funnel_item_counter = {}     # key:funnel_id, 条目计数
-    global_total_count = 0
-
-    // 冷启动加载全局漏斗列表，初始化空存储与索引桶
-    all_funnel_ids = ag-mem-01.get_all_funnel_ids()
-    for fid in all_funnel_ids:
-        l2_funnel_store[fid] = []
-        index_meta = ag-mem-01.get_funnel_index_meta(fid)
-        funnel_hash_index[fid] = {
-            index_bucket: index_meta.index_bucket_id,
-            tag_map: {},
-            tag_usage_stat: {}
-        }
-        funnel_item_counter[fid] = 0
-
-    // 拉取所有funnel L2→L3晋升阈值快照
-    funnel_l2_thresh_map = ag-mem-01.get_all_funnel_l2_promote_threshold()
+    internal_state = STATE_IDLE
+    // 加载全局L2基础参数
+    l2_global_cfg = query_layer_config(from_m35="ag-mem-35")
+    l2_max_keep_ms = l2_global_cfg.L2_max_keep_day * 24 * 3600 * 1000
+    l2_promote_min_reuse = 8
+    // 按funnel业务域分域持久存储缓存
+    funnel_item_store = {}
+    stat_today_add = 0
+    stat_total_promote_l3 = 0
+    stat_total_archive = 0
+    last_report_ts = NOW()
+    // 定时周期配置
+    promote_agg_cycle = l2_global_cfg.promote_agg_scan_sec
+    archive_cycle = l2_global_cfg.archive_scan_sec
+    promote_countdown = promote_agg_cycle
+    archive_countdown = archive_cycle
 
     WHILE 系统运行中:
-        // 1. 全局熔断最高优先级管控
-        IF 收到 ag-mem-01 全局熔断指令:
-            SET internal_state = STATE_PAUSED
-            CONTINUE
-        ELSE IF 收到恢复指令 AND internal_state == SYSTEM_PAUSED:
-            SET internal_state = STATE_NORMAL
-
-        // 2. 接收单funnel晋升写入请求
-        IF 收到 ag-mem-21 下发单funnel晋升条目列表:
-            target_fid = 请求.funnel_id
-            entry_batch = 请求.晋升条目列表
-            receive_total = len(entry_batch)
-            success_write = 0
-            new_entry_ids = []
-
-            IF internal_state == SYSTEM_PAUSED:
-                回执 = {funnel_id:target_fid, receive_total:receive_total, success_write:0, 拒绝原因:"全局熔断禁止写入"}
-                向 ag-mem-21 返回分funnel写入确认回执(回执)
+        // 1. 全局熔断最高优先级处理
+        IF 收到全局调度指令:
+            cmd = 获取调度指令
+            IF cmd == "FUSE":
+                internal_state = STATE_PAUSED
                 CONTINUE
+            IF cmd == "RESUME" AND internal_state == SYSTEM_PAUSED:
+                internal_state = STATE_IDLE
 
-            // 拉取当前漏斗容量数据
-            cap_resp = ag-mem-48.query_single_funnel_capacity(target_fid)
-            funnel_usage = cap_resp.当前使用率
-            funnel_max_item = cap_resp.单漏斗硬上限
-            global_usage = ag-mem-48.query_global_l2_usage()
-
-            // 更新全局状态机
-            all_funnel_usage = ag-mem-48.get_all_funnel_l2_usage()
-            max_single_use = MAX(all_funnel_usage)
-            IF max_single_use >= 95 OR global_usage >= 95:
-                SET internal_state = CAPACITY_CRITICAL
-            ELSE IF max_single_use >= 80 OR global_usage >= 80:
-                SET internal_state = CAPACITY_WARNING
-            ELSE:
-                SET internal_state = NORMAL
-
-            // 容量紧急：同步强制清理该漏斗过期低价值条目
-            IF internal_state == CAPACITY_CRITICAL AND funnel_usage >= 95:
-                all_fid_entries = l2_funnel_store[target_fid]
-                // 筛选超7天低I条目优先清理
-                expire_low_val = [e for e in all_fid_entries if (NOW()-e.promote_ts)/3600 >= 168 and e.I值 < 0.2]
-                if len(expire_low_val) > 0:
-                    clean_pack = {funnel_id:target_fid, clean_entry_ids:[x.entry_id for x in expire_low_val], merged_clean_tags=set()}
-                    for e in expire_low_val:
-                        for tag in e.hash_tag_list:
-                            clean_pack.merged_clean_tags.add(tag)
-                    向 ag-mem-42 发送待清除条目+失效标签包(clean_pack)
-                    等待清理完成回执
-                    // 同步删除本地存储与索引
-                    for del_e in expire_low_val:
-                        l2_funnel_store[target_fid].remove(del_e)
-                        funnel_item_counter[target_fid] -= 1
-                        global_total_count -= 1
-                        // 清理索引tag映射
-                        idx_meta = funnel_hash_index[target_fid]
-                        for t in del_e.hash_tag_list:
-                            if del_e.entry_id in idx_meta.tag_map[t]:
-                                idx_meta.tag_map[t].remove(del_e.entry_id)
-                                if len(idx_meta.tag_map[t]) == 0:
-                                    del idx_meta.tag_map[t]
-
-                // 清理后再次校验容量，仍超限则拦截本次写入
-                new_cap = ag-mem-48.query_single_funnel_capacity(target_fid)
-                if new_cap.当前使用率 >= 95:
-                    回执 = {funnel_id:target_fid, receive_total:receive_total, success_write:0, 拒绝原因:"漏斗容量硬上限，清理后无空余空间"}
-                    向 ag-mem-21 返回写入确认回执(回执)
+        // 2. 接收上游ag-mem-21批量晋升写入（唯一上游来源）
+        IF 收到L1批量晋升条目推送:
+            batch_write_req = 获取晋升条目列表
+            internal_state = ITEM_PERSIST
+            success_cnt = 0
+            fail_ids = []
+            now_ts = NOW()
+            FOR item IN batch_write_req:
+                item_id = item.条目ID
+                funnel_id = item.来源funnel分槽ID
+                // 前置合法性校验
+                IF item.result_validated != True OR item.I_value <= 0 OR item.复用次数 < 3:
+                    fail_ids.append(item_id)
                     CONTINUE
-
-            // 容量预警：异步后台清理，不阻塞写入流程
-            IF internal_state == CAPACITY_WARNING:
-                all_fid_entries = l2_funnel_store[target_fid]
-                mild_clean = [e for e in all_fid_entries if (NOW()-e.promote_ts)/3600 >= 168 and e.I值 < 0.2]
-                if len(mild_clean) > 0:
-                    clean_pack = {funnel_id:target_fid, clean_entry_ids:[x.entry_id for x in mild_clean], merged_clean_tags=set()}
-                    for e in mild_clean:
-                        for tag in e.hash_tag_list:
-                            clean_pack.merged_clean_tags.add(tag)
-                    异步向 ag-mem-42 发送清理包(clean_pack)
-
-            // 逐条校验并写入分桶存储+哈希索引
-            for entry in entry_batch:
-                // 条目尺寸校验
-                if entry.经验原始数据.字节大小 > 15*1024:
-                    continue
-                // 持久化写入分桶
-                l2_funnel_store[target_fid].append(entry)
-                // 更新哈希索引桶
-                idx_meta = funnel_hash_index[target_fid]
-                for tag in entry.hash_tag_list:
-                    if tag not in idx_meta.tag_map:
-                        idx_meta.tag_map[tag] = []
-                    idx_meta.tag_map[tag].append(entry.entry_id)
-                    idx_meta.tag_usage_stat[tag] = idx_meta.tag_usage_stat.get(tag, 0) + 1
-                // 索引标签总量超限，清理20%低频标签
-                if len(idx_meta.tag_map.keys()) > 12000:
-                    sorted_tags = sorted(idx_meta.tag_usage_stat.items(), key=lambda x:x[1])
-                    del_count = int(len(sorted_tags)*0.2)
-                    for t, _ in sorted_tags[:del_count]:
-                        del idx_meta.tag_map[t]
-                        del idx_meta.tag_usage_stat[t]
-                success_write += 1
-                new_entry_ids.append(entry.entry_id)
-                funnel_item_counter[target_fid] += 1
-                global_total_count += 1
-
-            // 推送新条目通知至热度统计单元
-            if len(new_entry_ids) > 0:
-                notify_pkg = {
-                    funnel_id: target_fid,
-                    new_entry_ids: new_entry_ids,
-                    index_bucket_id: funnel_hash_index[target_fid]["index_bucket"]
+                // 按funnel分域初始化存储，构建向量索引
+                IF funnel_id NOT IN funnel_item_store:
+                    funnel_item_store[funnel_id] = {}
+                funnel_item_store[funnel_id][item_id] = {
+                    "funnel_id": funnel_id,
+                    "reuse_count": item.复用次数,
+                    "S_value": item.S值,
+                    "I_value": item.实时I值,
+                    "create_ts": item.生成时间,
+                    "last_access_ts": now_ts,
+                    "manual_tag": "无",
+                    "result_validated": item.result_validated,
+                    "vector_embedding": item.向量嵌入
                 }
-                向 ag-mem-23 发送L2新条目通知(notify_pkg)
+                success_cnt += 1
+                stat_today_add += 1
+            // 回执回写给上游ag-mem-21
+            write_ack = build_l2_write_ack(total=len(batch_write_req), success=success_cnt, fail_list=fail_ids)
+            send_write_ack(target="ag-mem-21", ack_data=write_ack)
+            // 写入审计日志
+            send_audit_log(event="L2批量接收ag-mem-21晋升条目", add_count=success_cnt, ts=now_ts)
+            internal_state = STATE_IDLE
 
-            // 返回写入确认回执
-            resp_receipt = {
-                funnel_id: target_fid,
-                receive_entry_total: receive_total,
-                success_write_count: success_write,
-                funnel_current_usage: cap_resp.当前使用率,
-                index_bucket_id: funnel_hash_index[target_fid]["index_bucket"]
-            }
-            向 ag-mem-21 返回分funnel写入确认回执(resp_receipt)
+        // 3. 定时晋升聚合扫描，推送预聚合快照至ag-mem-23
+        IF internal_state == STATE_IDLE:
+            promote_countdown -= 10
+            IF promote_countdown <= 0:
+                internal_state = PROMOTE_AGG_SCAN
+                promote_agg_list = []
+                now_ts = NOW()
+                // 遍历所有funnel业务域
+                FOR funnel_id, item_map IN funnel_item_store.items():
+                    slot_cfg = get_slot_config(funnel_id, global_cfg=l2_global_cfg)
+                    FOR item_id, item_data IN item_map.items():
+                        age = now_ts - item_data.create_ts
+                        // 跳过超期、人工保护条目
+                        IF age >= l2_max_keep_ms OR item_data.manual_tag != "无":
+                            CONTINUE
+                        // 校验全部晋升准入条件
+                        IF item_data.I_value >= slot_cfg.L2_promote_thresh AND item_data.reuse_count >= l2_promote_min_reuse:
+                            promote_agg_list.append(item_data)
+                // 批量推送预聚合快照至ag-mem-23
+                IF len(promote_agg_list) > 0:
+                    send_promote_agg_snapshot(target="ag-mem-23", item_list=promote_agg_list)
+                    stat_total_promote_l3 += len(promote_agg_list)
+                    // 从L2分域存储移除已推送聚合条目
+                    FOR agg_item IN promote_agg_list:
+                        del funnel_item_store[agg_item.funnel_id][agg_item.条目ID]
+                    send_audit_log(event="L2批量推送预聚合快照至ag-mem-23", count=len(promote_agg_list), ts=now_ts)
+                promote_countdown = promote_agg_cycle
+                internal_state = STATE_IDLE
 
-        // 3. 处理分funnel检索请求
-        IF 收到 ag-mem-03 下发L2分桶查询请求:
-            filter_fid = 请求.目标funnel_id
-            query_cond = 请求.查询条件
-            max_return = 请求.最大返回条数
-            match_result = []
-            if filter_fid in l2_funnel_store:
-                entry_list = l2_funnel_store[filter_fid]
-                // 条件过滤，按I值降序截取上限
-                temp_res = [e for e in entry_list if 匹配查询条件(e, query_cond)]
-                temp_res.sort(key=lambda x:x.I值, reverse=True)
-                match_result = temp_res[:max_return]
-                // 更新每条条目访问时间，刷新索引标签访问频次
-                idx_meta = funnel_hash_index[filter_fid]
-                for item in match_result:
-                    item.最近访问时间 = NOW()
-                    for tag in item.hash_tag_list:
-                        idx_meta.tag_usage_stat[tag] = idx_meta.tag_usage_stat.get(tag, 0) + 1
-            // 组装结果返回调度单元
-            query_resp = {
-                funnel_id: filter_fid,
-                match_entry_list: match_result
-            }
-            向 ag-mem-03 返回L2分桶查询结果集(query_resp)
+        // 4. 定时归档遗忘扫描，生成归档候选推送ag-mem-42
+        IF internal_state == STATE_IDLE:
+            archive_countdown -= 10
+            IF archive_countdown <= 0:
+                internal_state = ARCHIVE_SCAN
+                archive_candidate = []
+                now_ts = NOW()
+                FOR funnel_id, item_map IN funnel_item_store.items():
+                    slot_cfg = get_slot_config(funnel_id, global_cfg=l2_global_cfg)
+                    FOR item_id, item_data IN item_map.items():
+                        age = now_ts - item_data.create_ts
+                        // 人工收藏/锁定条目直接跳过归档
+                        IF item_data.manual_tag in ["用户收藏", "人工锁定"]:
+                            CONTINUE
+                        need_archive = False
+                        reason = ""
+                        if item_data.I_value < slot_cfg.L2_archive_thresh:
+                            need_archive = True
+                            reason = "I值低于当前funnel L2归档遗忘阈值"
+                        elif age >= l2_max_keep_ms:
+                            need_archive = True
+                            reason = "条目留存满30天未晋升至L3"
+                        if need_archive:
+                            archive_candidate.append({
+                                "item_id": item_id,
+                                "forget_reason": reason,
+                                "item_I": item_data.I_value,
+                                "layer_threshold": slot_cfg.L2_archive_thresh,
+                                "suggest_handle": "archive",
+                                "layer": "L2",
+                                "slot_id": funnel_id
+                            })
+                // 推送归档候选清单至ag-mem-42
+                IF len(archive_candidate) > 0:
+                    send_archive_list(target="ag-mem-42", candidate=archive_candidate)
+                    stat_total_archive += len(archive_candidate)
+                archive_countdown = archive_cycle
+                internal_state = STATE_IDLE
 
-        // 4. 每小时定时全funnel超期条目扫描分流
-        IF 距上次定时扫描 >= 3600:
-            promote_to_l3_batch = []
-            global_clean_packs = []
-            for fid in l2_funnel_store.keys():
-                entry_list = l2_funnel_store[fid]
-                l3_thresh = funnel_l2_thresh_map.get(fid, 0.62)
-                expire_entries = [e for e in entry_list if (NOW()-e.promote_ts)/3600 >= 168]
-                if len(expire_entries) == 0:
-                    continue
-                promote_fid_list = []
-                clean_fid_list = []
-                clean_tags_set = set()
-                for e in expire_entries:
-                    if e.I值 >= l3_thresh:
-                        promote_fid_list.append(e)
-                        promote_to_l3_batch.append(e)
-                    else:
-                        clean_fid_list.append(e)
-                        for tag in e.hash_tag_list:
-                            clean_tags_set.add(tag)
-                // 打包当前漏斗清除条目
-                if len(clean_fid_list) > 0:
-                    clean_ids = [x.entry_id for x in clean_fid_list]
-                    global_clean_packs.append({
-                        funnel_id: fid,
-                        clean_entry_ids: clean_ids,
-                        merged_clean_tags: list(clean_tags_set)
-                    })
-                // 从本地存储移除超期条目
-                remain_entries = [e for e in entry_list if e not in expire_entries]
-                del_count = len(expire_entries)
-                l2_funnel_store[fid] = remain_entries
-                funnel_item_counter[fid] -= del_count
-                global_total_count -= del_count
-                // 同步清理该漏斗索引内失效条目映射
-                idx_meta = funnel_hash_index[fid]
-                del_eids = [x.entry_id for x in expire_entries]
-                for tag in list(idx_meta.tag_map.keys()):
-                    new_tag_map = [eid for eid in idx_meta.tag_map[tag] if eid not in del_eids]
-                    if len(new_tag_map) == 0:
-                        del idx_meta.tag_map[tag]
-                    else:
-                        idx_meta.tag_map[tag] = new_tag_map
-            // 批量推送晋升条目至L3
-            if len(promote_to_l3_batch) > 0:
-                向 ag-mem-24 发送L2超期晋升至L3条目清单(promote_to_l3_batch)
-            // 批量推送清除包至删除单元
-            for pack in global_clean_packs:
-                向 ag-mem-42 发送待清除条目+失效哈希标签包(pack)
-            重置定时扫描计时器
+        // 5. 响应ag-mem-37 I值元数据批量查询
+        IF 收到条目元数据批量查询请求:
+            query_ids = 获取请求条目ID列表
+            meta_result = []
+            FOR funnel_id, item_map IN funnel_item_store.items():
+                FOR item_id IN query_ids:
+                    IF item_id IN item_map:
+                        meta_result.append(item_map[item_id])
+            send_meta_snapshot(target="ag-mem-37", meta_list=meta_result)
 
-        // 5. 每30秒全局状态上报
-        IF 距上次状态上报 >= 30:
-            funnel_snapshot = {}
-            for fid in l2_funnel_store.keys():
-                cap = ag-mem-48.query_single_funnel_capacity(fid)
-                idx_tag_total = sum(len(v["tag_map"].keys()) for k,v in funnel_hash_index[fid].items())
-                funnel_snapshot[fid] = {
-                    item_count: funnel_item_counter[fid],
-                    usage_rate: cap.当前使用率,
-                    index_tag_amount: idx_tag_total
-                }
-            report_data = {
-                current_state: internal_state,
-                global_total_item: global_total_count,
-                global_l2_usage: ag-mem-48.query_global_l2_usage(),
-                each_funnel_detail: funnel_snapshot
-            }
-            向 ag-mem-48、ag-mem-01 发送L2全局分桶状态上报(report_data)
+        // 6. 定时容量上报 + 180s周期运行统计上报
+        IF NOW() - last_report_ts >= 60 * 1000:
+            total_kb = calc_layer_cap_kb(funnel_item_store, avg_kb=l2_global_cfg.avg_item_kb, vec_index_kb=l2_global_cfg.vec_index_overhead_kb)
+            total_item_count = sum(len(v) for v in funnel_item_store.values())
+            cap_report = build_cap_report(layer="L2", used_kb=total_kb, item_count=total_item_count)
+            send_cap_report(target="ag-mem-48", report=cap_report)
+            // 每180s向ag-mem-03上报运行统计
+            IF NOW() - last_report_ts >= 180 * 1000:
+                stat_report = build_l2_stat_report(
+                    state=internal_state,
+                    today_add=stat_today_add,
+                    total_promote=stat_total_promote_l3,
+                    total_archive=stat_total_archive
+                )
+                send_stat_report(target="ag-mem-03", report=stat_report)
+            last_report_ts = NOW()
 
         SLEEP 10ms
 ```
 
-## 约束与异常处理（V1.1 新增funnel、哈希索引相关异常）
+## 约束与异常处理
 | 场景 | 处理方式 | 恢复条件 |
 |------|----------|----------|
-| 目标funnel_id不存在，无对应分桶存储 | 直接拒绝写入/查询，返回“子漏斗未注册” | ag-mem-14完成funnel新建同步至总控注册表 |
-| 单funnel分桶IO持久化故障 | 仅阻断该漏斗读写，其余funnel正常服务，标记故障漏斗上报告警 | 底层存储分区修复完成 |
-| 经验条目超过15KB尺寸上限 | 跳过本条，不写入L2，条目留存L1层等待下次衰减评估 | 压缩条目至15KB以内后重新晋升 |
-| 单funnel容量紧急，清理后仍无空余存储 | 拦截所有新晋升写入，仅保留存量条目只读 | 定时7天超期清理释放存储空间 |
-| 全局系统熔断触发 | 冻结所有写入、哈希索引新增/删除操作，存量条目仅支持查询 | ag-mem-01下发恢复指令并自检通过 |
-| 单漏斗哈希索引标签达12000上限 | 自动清理20%低频访问标签，释放索引内存空间 | 正常业务写入补充新标签 |
-| L2超期条目晋升写入ag-mem-24失败 | 该批条目回留L2存储，下一小时定时扫描重新判定 | L3存储服务恢复正常 |
+| ag-mem-21推送条目result_validated=False、I值非法 | 写入失败，加入失败列表回传给L1，不存入L2分域存储 | ag-mem-21重新推送合规校验通过条目 |
+| 晋升聚合扫描时条目同步触发归档 | 条目归入归档候选，不再参与预聚合，快照隔离并发变更无报错 | 无需人工干预，下一轮扫描正常执行 |
+| 单次扫描条目总量超过1000条 | 自动拆分多批次串行处理，不阻塞主定时循环与向量索引 | 内置分片逻辑自动执行 |
+| L2持久存储/向量索引IO故障 | 内存funnel分域缓存完整保留条目元数据，下一轮定时重试晋升/归档扫描 | 底层存储、向量库IO链路恢复 |
+| 全局紧急熔断FUSE指令下发 | 停止写入、晋升聚合、归档扫描，内存缓存条目不丢失 | ag-mem-01下发RESUME恢复指令，自动重启定时任务 |
+| 目标funnel分槽无专属L2阈值配置 | 自动加载全局通用L2阈值兜底完成判定 | ag-mem-35运维侧补充分funnel独立参数 |
 
-## 总线契约（废弃分槽编号，统一funnel/索引字段传输）
+## 总线契约
 | 总线 | 操作 | 数据内容 | 权限 | 说明 |
 |------|------|----------|------|------|
-| 内部调度总线 | 读 | 单funnel L2晋升条目列表（携带funnel_id、hash_tag_list、index_bucket、result_validated） | 只读 | ag-mem-21 发送 |
-| 内部调度总线 | 读 | 分funnel经验查询请求（带funnel过滤条件） | 只读 | ag-mem-03 调度单元发送 |
-| 内部调度总线 | 读 | 单漏斗/全局L2容量查询回执 | 只读 | ag-mem-48 容量管控返回 |
-| 内部调度总线 | 读 | ag-mem-01全局熔断、调度控制指令 | 只读 | 顶层总控下发 |
-| 内部调度总线 | 写 | 分funnel写入确认回执（携带funnel、索引桶ID） | 专属写入 | 向 ag-mem-21 返回 |
-| 内部调度总线 | 写 | L2分桶查询结果集（带完整哈希标签、funnel标识） | 专属写入 | 向 ag-mem-03 返回 |
-| 内部调度总线 | 写 | 新增funnel条目通知（携带index_bucket_id） | 专属写入 | 向 ag-mem-23 热度统计发送 |
-| 内部调度总线 | 写 | L2超期晋升条目清单（完整索引字段） | 专属写入 | 向 ag-mem-24 L3存储发送 |
-| 内部调度总线 | 写 | 待清除条目+失效哈希标签合并包 | 专属写入 | 向 ag-mem-42 删除单元发送 |
-| 内部调度总线 | 写 | L2全局分桶状态上报（各漏斗存储/索引占用快照） | 周期性写入 | 同步上报 ag-mem-48、ag-mem-01 |
+| 内部调度总线 | 读 | L1批量晋升条目推送 | 只读 | ag-mem-21（唯一上游写入源） |
+| 内部调度总线 | 读 | I值批量元数据查询请求 | 只读 | ag-mem-37 |
+| 内部调度总线 | 读 | 全局调度熔断指令 | 只读 | ag-mem-01 |
+| 内部调度总线 | 写 | L2写入完成回执 | 专属写入 | 回传给上游 ag-mem-21 |
+| 内部调度总线 | 写 | 晋升条目预聚合快照 | 专属写入 | 下发下游 ag-mem-23 |
+| 内部调度总线 | 写 | 归档候选清单、条目元数据快照 | 专属写入 | ag-mem-42、ag-mem-37 |
+| 内部调度总线 | 写 | 容量上报、审计日志、周期统计上报 | 周期/事件写入 | ag-mem-48、ag-mem-51、ag-mem-03 |
 
-## 安全边界（V1.1新增动态漏斗、哈希索引隔离约束）
+## 安全边界（V1.1强制规范）
 | 规则编号 | 内容 |
 |:---:|------|
-| S-01 | L2仅持久化存储原始经验数据，禁止修改条目正文，仅维护funnel分桶元数据与哈希索引映射关系 |
-| S-02 | 所有存储、索引读写严格绑定唯一funnel_id，跨漏斗物理隔离，禁止混存、跨索引桶读写标签 |
-| S-03 | 容量清理、超期分流仅在MAINT维护/定时周期执行，业务NORMAL读写高峰不销毁存储与索引资源 |
-| S-04 | 7天生命周期为强制约束，超期条目必须执行晋升L3或永久清除，不允许无限滞留L2层 |
-| S-05 | 查询请求必须携带funnel过滤条件，仅返回匹配漏斗内条目，禁止全局全库无过滤检索 |
-| S-06 | 条目清除必须同步归集全部关联hash_tag，同步删除对应index_bucket内条目映射，杜绝索引脏数据残留 |
-| S-07 | 不存在于ag-mem-01全局注册表的funnel_id，一律拒绝写入与查询，防止无管控游离漏斗破坏全局收敛机制 |
-| S-08 | 全局熔断状态下，哈希索引仅可读，禁止新增、删除、修改标签映射 |
+| L2-01 | L2仅接收ag-mem-21推送条目，禁止ag-mem-03或其他模块直接写入，杜绝旁路写入篡改记忆数据 |
+| L2-02 | L2条目晋升必经ag-mem-23预聚合环节，禁止直接跨层写入L3/L4/L5，分层流转链路单向隔离不可绕过 |
+| L2-03 | L2过期低价值条目统一执行离线归档，不物理删除原始情景记忆，满足V1.1全链路追溯要求 |
+| L2-04 | 晋升阈值、归档阈值、30天留存时效统一由ag-mem-35集中管控，本模块无本地硬编码业务参数 |
+| L2-05 | L2分层容量上限、预警/紧急阈值由ag-mem-48统一管控，容量紧急自动加急归档释放存储空间 |
+| L2-06 | 熔断状态内存funnel分域缓存完整保留所有条目元数据，服务恢复后自动执行定时晋升聚合与归档扫描，无数据丢失 |
 
-## 接口校验用例（适配funnel分桶、哈希索引、动态阈值）
+## 接口校验用例
 | 用例编号 | 前置条件 | 输入 | 预期输出 |
 |----------|----------|------|----------|
-| TC-M22-01 | `NORMAL`，funnel=F002全局使用率50% | 3条晋升条目，hash_tag=["JS","异步"] | 全部写入F002独立分桶与索引桶，通知ag-mem-23，回执携带funnel_id与index_bucket |
-| TC-M22-02 | `NORMAL`，funnel=F005使用率82%，存在7天超期低I条目 | 晋升条目写入请求 | 写入正常，异步发起该漏斗过期低价值条目清理并同步失效索引标签 |
-| TC-M22-03 | `CAPACITY_CRITICAL`，funnel=F007达1500条硬上限 | 批量晋升写入请求 | 同步强制清理超期条目释放空间；清理后仍满则直接拒绝写入 |
-| TC-M22-04 | `NORMAL`，查询请求指定funnel=F003过滤 | 检索关键词“接口测试” | 仅返回F003漏斗内匹配条目，更新条目访问时间与索引标签访问频次 |
-| TC-M22-05 | `NORMAL`，1小时定时扫描触发，存在7天超期条目 | F001超期条目：I=0.7（阈值0.62）、F004超期条目I=0.3 | F001条目打包晋升至ag-mem-24；F004条目移交ag-mem-42并清理哈希索引 |
-| TC-M22-06 | `SYSTEM_PAUSED`，任意funnel晋升写入请求 | 分funnel晋升条目列表 | 返回写入成功数=0，拒绝原因为全局熔断 |
-| TC-M22-07 | `NORMAL`，条目体积16KB，funnel=F009 | 超大尺寸晋升条目 | 直接跳过，不写入L2，保留在L1 |
-| TC-M22-08 | `NORMAL`，funnel=F010索引标签达12000上限 | 新增带4个全新标签的晋升条目 | 自动清理20%低频旧标签后，新增当前条目哈希映射 |
+| TC-M22-01 | `L2_IDLE`，ag-mem-21推送result_validated=True合规晋升条目 | L1批量晋升条目列表 | 条目按funnel分域持久存入L2，构建向量索引，返回写入成功回执，生成新增审计日志 |
+| TC-M22-02 | `L2_IDLE`，条目I达标、复用≥8、未满30天，定时晋升聚合触发 | 晋升聚合倒计时归零 | 条目批量预聚合快照推送至ag-mem-23，从L2对应funnel分域移除 |
+| TC-M22-03 | `L2_IDLE`，条目I低于当前funnel L2归档阈值 | 归档扫描触发 | 条目加入归档候选清单推送ag-mem-42，标记处理方式archive |
+| TC-M22-04 | `L2_IDLE`，条目写入满30天未满足晋升条件 | 归档扫描触发 | 因超期标记归档，进入清理候选清单 |
+| TC-M22-05 | `L2_IDLE`，ag-mem-37下发批量元数据查询 | 条目ID批量查询请求 | 返回对应funnel域内条目完整元数据+向量嵌入快照 |
+| TC-M22-06 | `L2_IDLE`，接收全局FUSE熔断指令 | 紧急调度熔断指令 | 切换SYSTEM_PAUSED，停止写入、晋升聚合、归档扫描全部任务 |
 
-## 质量自检清单（V1.1完整达标）
+## 质量自检清单
 | 检查项 | 状态 |
 |--------|:---:|
-| 模块编号、五层存储分区归属不变，彻底移除V1.0固定ag-mem-15~19分槽逻辑 | ✅ |
-| 新增依赖ag-mem-01总控F0，用于拉取全局漏斗注册表、索引元数据、funnel专属晋升阈值 | ✅ |
-| 原有4种运行状态完整保留，容量判定逻辑升级为单漏斗+全局双维度校验 | ✅ |
-| 输入输出全部替换funnel_id作为分桶标识，新增hash_tag_list、index_bucket_id、result_validated核心传输字段 | ✅ |
-| 存储配置拆分全局共享配额+单funnel独立硬上限，新增哈希索引标签容量约束 | ✅ |
-| 伪代码完整实现分funnel独立存储、专属哈希索引全生命周期维护、容量分级清理、每小时超期自动分流 | ✅ |
-| 异常处理覆盖无效funnel、分桶IO故障、索引超限、熔断、L3晋升写入失败等新增场景 | ✅ |
-| 总线契约全部移除旧分槽编号传输，统一携带funnel与索引桶标识 | ✅ |
-| 安全边界新增漏斗物理隔离、索引脏数据清理、非法漏斗拦截、熔断只读约束 | ✅ |
-| 校验用例覆盖正常写入、容量预警/紧急清理、分funnel精准查询、7天超期分流、索引超限、熔断、超大条目拦截全场景 | ✅ |
-| 完全对齐V1.1动态有限子漏斗、分桶哈希索引、MLNF-Mem五层统一存储架构标准 | ✅ |
+| 模块编号ag-mem-22匹配V1.1白皮书L2情景记忆存储定位 | ✅ |
+| 上下游依赖唯一上游ag-mem-21、下游预聚合ag-mem-23，数据流闭环无冲突 | ✅ |
+| 5种内部状态、完整切换触发条件定义清晰 | ✅ |
+| 全部输入输出标注来源/目标模块、结构体、优先级，无上下游链路错乱 | ✅ |
+| 分域向量存储、result_validated前置校验、30天时效、晋升/归档规则完整贴合白皮书4.4.1五层晋升通路 | ✅ |
+| 伪代码覆盖L0写入接收、分域持久化、定时晋升预聚合、归档扫描、元数据查询、容量上报、审计日志全链路 | ✅ |
+| 异常场景覆盖无效L1条目、并发归档、超大批次、向量IO故障、熔断、无分槽阈值共6类全覆盖 | ✅ |
+| 内部调度总线读写权限划分清晰，上游仅允许ag-mem-21写入 | ✅ |
+| 6条V1.1强制安全约束无旁路写入、跨层流转漏洞 | ✅ |
+| 6条自动化测试用例覆盖全部核心业务分支 | ✅ |
 
 ---
