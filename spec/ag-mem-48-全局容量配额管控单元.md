@@ -1,209 +1,222 @@
-# ag-mem-48-全局容量配额管控单元 接口规格（对齐Agent V1.1白皮书）
+# ag-mem-48 全局容量配额管控单元 完整标准化接口文档（对齐EM-Core-Agent V1.1白皮书）
 ## 基本信息
 | 项 | 内容 |
 |----|------|
 | 模块编号 | ag-mem-48 |
 | 模块名称 | 全局容量配额管控单元 |
-| 所属分区 | 三、漏斗二：任务经验漏斗 / 全局资源管控中枢 |
-| 核心职责 | 漏斗二全层级存储容量统一管理模块，实时采集ag-mem-20~28各分层存储占用空间、条目总量；维护各分槽、各层级存储容量上限配额；实时判定容量预警/紧急容量溢出阈值；向ag-mem-37下发容量加急刷新指令、向ag-mem-40推送容量紧急扫描标记、向ag-mem-42同步清理释放空间统计；接收各存储层空间变更上报，统一汇总全局容量数据；支持人工调整分层/分槽容量配额、配额变更审计；L5层级配置独立高容量保护配额，不触发强制清理；仅做容量统计、阈值判定、预警下发，不直接读写经验条目。 |
-| 依赖模块 | ag-mem-01（总控F0全局熔断调度）、人工运维配额配置接口（调整分层/分槽容量上限）、ag-mem-35（三维权重配置单元，读取分层标准容量阈值） |
-| 被依赖模块 | ag-mem-20~28（分层存储，定时上报当前占用容量）、ag-mem-37（接收容量加急刷新指令）、ag-mem-40（接收容量紧急扫描标记）、ag-mem-42（接收清理释放空间同步通知）、ag-mem-51（记忆变更日志追溯单元，记录配额变更、容量预警事件）、ag-mem-03（漏斗二调度单元，周期上报全局容量统计） |
+| 所属分区 | 全局基础底座 / 全链路资源容量管控中枢 |
+| 核心职责 | 统一接收所有ag-mem系列模块定时内存/存储占用上报；读取ag-mem-35容量维度全局配额、分层预警/紧急水位、单模块资源上限；实时汇总全系统内存、持久存储占用总量，判定容量预警/紧急溢出状态；向ag-mem-03漏斗二调度推送容量过载告警，触发分层清理、归档扩容调度；限制各模块缓存最大占用资源，超限下发缓存收缩指令；定时持久化全局容量大盘快照；所有容量超限告警、配额调整、缓存收缩操作写入ag-mem-51审计日志；仅做资源统计、配额判定、限流管控，无业务条目读写、分槽管理能力。 |
+| 依赖模块 | ag-mem-01（总控F0全局熔断，管控容量统计任务启停）、ag-mem-03（漏斗二调度，接收容量告警、下发资源收缩调度信号）、ag-mem-35（通用三维配置中心，读取全局总配额、分层存储容量上限、各模块缓存内存阈值、预警水位比例）、全ag-mem业务模块（接收各模块内存/存储占用上报） |
+| 被依赖模块 | ag-mem-01（周期上报全局容量大盘）、ag-mem-03（推送容量预警/紧急溢出告警报表）、全部业务模块（下发缓存收缩指令、资源超限限流提示）、ag-mem-51（记录容量变更、超限告警审计日志）、运维告警面板（全局资源过载告警推送） |
 
 ## 内部状态定义
 | 状态 | 标识 | 含义 | 触发条件 |
 |------|------|------|----------|
-| 容量监控就绪 | `CAP_MONITOR_READY` | 正常采集各分层容量数据，实时判定容量阈值，响应各类容量相关请求 | 系统初始化加载配额配置、熔断恢复、配额更新完成 |
-| 配额配置加载 | `LOAD_QUOTA_CFG` | 系统启动/人工修改配额，加载分层、分槽容量上限、预警阈值 | 服务初始化、人工下发配额调整指令 |
-| 容量数据汇总计算 | `CALC_CAP_STAT` | 聚合各分层上报的空间、条目数量，计算占用率、剩余空间 | 收到分层存储容量上报数据包 |
-| 预警指令下发 | `ALERT_SEND` | 判定达到预警/紧急阈值，向ag-mem-37下发加急刷新指令 | 分层容量占用触发阈值标准 |
-| 暂停服务 | `SYSTEM_PAUSED` | 全局熔断，暂停容量采集、阈值判定、预警下发，拒绝配额修改操作 | F0下发FUSE熔断指令；RESUME切回CAP_MONITOR_READY |
+| 容量统计待机就绪 | `CAP_IDLE` | 资源统计缓存空闲，持续接收各模块容量上报，无批量配额重算任务 | 系统初始化加载配额配置、熔断恢复、一轮全局容量汇总完成 |
+| 模块容量上报缓存聚合 | `METRIC_FETCH` | 周期性拉取/接收全模块资源占用指标，聚合存入全局容量缓存 | 定时容量汇总周期抵达 |
+| 配额水位判定计算 | `QUOTA_CALC` | 对照ag-mem-35容量维度阈值，计算分层、单模块、全局资源占用水位，标记预警/紧急状态 | 全模块容量指标聚合完成 |
+| 容量告警&收缩指令下发 | `ALERT_DISPATCH` | 向ag-mem-03推送容量告警，向超限模块下发缓存收缩指令，输出全局容量大盘 | 配额水位判定完成 |
+| 暂停降级 | `SYSTEM_PAUSED` | 收到F0 PAUSE/FUSE熔断指令，停止全局批量容量汇总，仅保留单模块实时上报接收 | ag-mem-01下发熔断指令；RESUME切回CAP_IDLE |
 
 ## 输入数据
 | 输入项 | 数据类型 | 来源模块 | 触发条件 | 优先级 |
 |--------|----------|----------|----------|:---:|
-| 分层容量占用上报 | Struct（层级、分槽ID、当前占用KB、条目总数、单条平均体积KB） | ag-mem-20~28 分层存储单元 | 每60秒定时上报、条目新增/删除后即时上报 | 高 |
-| 人工配额调整指令 | Struct（层级/分槽ID、新容量上限KB、预警阈值占比、紧急溢出占比、管理员ID、双重确认挑战码） | 人工运维配额配置接口 | 运维调整分层/分槽存储配额上限 | **最高** |
-| 清理释放空间同步通知 | Struct（目标层级、本次释放KB、清理条目数量） | ag-mem-42 冗余记忆删除与归档单元 | 每批次清理归档完成后同步释放容量 | 普通 |
-| 分层标准容量阈值配置回执 | Struct（L1~L5默认容量上限、预警占比80%、紧急占比95%） | ag-mem-35 三维权重配置单元 | 模块初始化、容量阈值规则更新 | 普通 |
-| 全局调度指令 | Enum（PAUSE/RESUME/FUSE） | ag-mem-01 总控F0 | 系统紧急故障、模式切换 | 紧急 |
+| 模块资源占用定时上报 | Struct（module_id、缓存占用KB、持久存储占用KB、最大允许缓存KB、条目总占用） | 全部ag-mem子模块（01/03/15~30/35/37/40/41/42/45） | 各模块每60秒定时上报 | 高 |
+| 全局三维容量配置回执 | Struct（系统总内存配额、L0~L5分层存储最大容量、单模块缓存上限、预警水位占比、紧急溢出水位占比） | ag-mem-35 通用配置中心 | 模块初始化、容量配额策略更新、每轮汇总前拉取 | 普通 |
+| 全局调度熔断指令 | Enum(PAUSE/RESUME/FUSE) | ag-mem-01 F0总控 | 全局熔断切换，管控容量汇总批量任务 | 紧急 |
+| 运维配额手动调整指令 | Struct（目标模块/分层、新容量上限、管理员ID、双重校验码） | 运维后台面板 | 人工调整分层/模块资源配额 | 最高 |
 
 ## 输出数据
 | 输出项 | 数据类型 | 目标模块 | 输出条件 | 优先级 |
 |--------|----------|----------|----------|:---:|
-| 容量加急刷新指令 | Struct（触发层级、预警等级、强制扫描L4标记） | ag-mem-37 重要度增量定时刷新单元 | 分层容量达到预警/紧急阈值 | 高 |
-| 容量紧急扫描标记 | Struct（触发层级、触发原因=容量紧急） | ag-mem-40 遗忘阈值判定单元 | 容量达到紧急溢出阈值 | 高 |
-| 配额调整完成回执 | Struct（修改层级/分槽、新旧容量上限、生效时间戳） | 人工运维配额配置接口 | 配额参数校验、持久化完成 | **最高** |
-| 容量配额变更/预警审计日志 | Struct（事件类型、层级、当前占用率、阈值、时间戳） | ag-mem-51 记忆变更日志追溯单元 | 配额修改、容量预警、容量紧急溢出触发 | 高 |
-| 全局容量周期统计上报 | Struct（当前状态、各层级总配额、总占用KB、剩余空间、今日紧急预警次数） | ag-mem-03 漏斗二专属调度单元 | 每180秒周期性上报 | 普通 |
+| 模块缓存收缩指令 | Struct（module_id、强制收缩目标KB、收缩冷却时长） | 占用超限的对应业务模块 | 模块缓存占用超过配置单模块上限 | 高 |
+| 全局容量水位告警报表 | Struct（全局总占用、分层各层占用、预警/紧急标记、超限模块清单、建议处置方案） | ag-mem-03、运维告警面板 | 全局/分层资源达到预警/紧急水位 | 高 |
+| 全局容量大盘周期快照 | List<Struct>（module_id、当前占用、配额上限、水位占比） | ag-mem-01 全局F0调度单元 | 每一轮完整容量汇总计算完成 | 普通 |
+| 容量管控审计日志 | Struct（事件类型、超限模块/分层、占用水位、收缩指令范围、管理员、时间戳） | ag-mem-51 记忆变更日志追溯单元 | 容量超限告警、人工配额修改、缓存收缩指令下发完成 | 普通 |
+| 容量单元自身内存占用上报 | Struct（单元ag-mem-48、指标缓存总KB、记录模块总量） | 自身指标上报链路（自上报） | 每60秒定时上报 | 普通 |
+| 容量管控周期运行统计上报 | Struct（当前状态、今日预警次数、紧急溢出次数、下发缓存收缩总批次、人工配额修改次数） | ag-mem-03 漏斗二调度单元 | 每180秒周期性上报 | 普通 |
 
-## 容量配额管控核心规则（V1.1分层资源保护标准）
-### 1. 分层默认配额与阈值标准（由ag-mem-35统一下发）
-| 层级 | 默认总容量上限 | 预警触发占比 | 紧急溢出占比 | 保护策略 |
-|:---:|:---:|:---:|:---:|------|
-| L1临时层 | 小容量 | 80% | 95% | 达到预警自动加急刷新清理 |
-| L2近期层 | 中容量 | 80% | 95% | 预警触发常规加急遗忘 |
-| L3中期层 | 大容量 | 80% | 95% | 紧急阈值强制归档清理 |
-| L4长期层 | 超大容量 | 85% | 98% | 紧急时强制开启L4扫描 |
-| L5核心层 | 独立隔离超大配额 | 95% | 100% | 仅告警，**禁止强制自动清理**，仅人工手动释放 |
-
-### 2. 阈值判定逻辑
-占用率 = 当前占用KB ÷ 分层总配额上限
-1. 占用率 ≥ 预警占比 ＜ 紧急占比：下发**预警加急刷新**指令至ag-mem-37
-2. 占用率 ≥ 紧急溢出占比：下发加急指令 + 向ag-mem-40携带「容量紧急」标记，触发兜底后20%低I条目清理
-3. L5层级仅生成告警日志，不推送任何自动清理、加急刷新指令
-
-### 3. 配额修改约束
-1. L5容量上限仅允许上调，禁止下调缩小配额；
-2. L1~L4配额下调不得低于系统最小安全容量底线；
-3. 所有配额调整操作必须管理员双重确认；
-4. 单条修改指令最多支持3个层级/分槽同步调整。
-
-### 4. 空间统计规则
-- 新增条目：占用容量同步上涨；
-- ag-mem-42完成删除/归档后，同步扣减占用空间；
-- L3/L4归档条目不计入活跃分层占用，划入离线归档分区统计，不触发分层容量预警。
+## 全局容量配额核心规则（V1.1容量维度标准，取自ag-mem-35配置）
+### 1. 三级水位判定标准
+1. 正常水位：占用占比 < 预警水位阈值，无任何限流、收缩动作；
+2. 预警水位：预警占比 ≤ 占用 < 紧急占比，推送容量预警，触发温和归档/清理调度；
+3. 紧急溢出水位：占用 ≥ 紧急占比，下发强制缓存收缩指令，触发大规模遗忘清理任务。
+### 2. 分层与单模块双重配额约束
+1. 分层存储独立上限：L0~L5各自配置最大持久容量，单分层超限即触发告警；
+2. 各业务模块独立缓存内存上限，模块本地缓存超出上限必须执行收缩；
+3. 全局总内存硬配额，所有模块缓存总和不可超过系统总内存上限。
+### 3. 人工配额修改约束
+1. 修改配额必须管理员双重挑战码校验；
+2. 配额下调不可低于模块最小运行保底容量（配置内置下限）；
+3. 配额修改即时生效，同步广播新版配额至对应模块。
+### 4. 熔断降级规则
+1. PAUSE半熔断：停止定时全局批量容量汇总，仅实时接收单模块上报，不主动下发批量收缩指令；
+2. FUSE全熔断：仅接收上报数据存储，关闭所有告警、收缩、配额计算逻辑。
+### 5. 批量约束
+单次批量下发缓存收缩指令最多30个模块，超量自动分片串行推送，避免总线消息风暴。
+### 6. 流转强制约束
+1. 仅统计资源占用、判定水位、下发收缩提示，无权限直接清理模块缓存、删除业务条目；
+2. 全部容量阈值、分层上限、模块缓存限额统一由ag-mem-35管控，本地无硬编码配额；
+3. 单向数据流：仅向外输出告警、收缩指令、统计报表，不参与记忆晋升、遗忘、存储写入业务；
+4. 模块上报缺失时使用历史占用数据兜底，连续3轮缺失标记模块离线告警。
 
 ## 核心处理逻辑
 ```
-FUNCTION capacity_quota_control_main_loop():
-    STATE_READY = CAP_MONITOR_READY
-    STATE_LOAD_CFG = LOAD_QUOTA_CFG
-    STATE_CALC_STAT = CALC_CAP_STAT
-    STATE_ALERT_SEND = ALERT_SEND
+FUNCTION global_quota_control_main_loop():
+    STATE_IDLE = CAP_IDLE
+    STATE_FETCH = METRIC_FETCH
+    STATE_CALC = QUOTA_CALC
+    STATE_DISPATCH = ALERT_DISPATCH
     STATE_PAUSED = SYSTEM_PAUSED
 
-    internal_state = STATE_LOAD_CFG
-    // 加载分层默认容量阈值配置
-    layer_quota_base = load_layer_cap_threshold(from_m35="ag-mem-35")
-    // 分层实时容量缓存 {层级: {占用KB, 总配额, 条目数}}
-    layer_cap_cache = {}
-    stat_emergency_alert = 0
-    stat_quota_modify = 0
-    last_report_ts = NOW()
+    internal_state = STATE_IDLE
+    // 读取ag-mem-35容量维度全套配额配置
+    cap_cfg = query_global_capacity_config(from_m35="ag-mem-35")
+    global_total_mem_quota = cap_cfg.system_total_memory
+    layer_storage_max = cap_cfg.layer_max_storage
+    module_cache_max_map = cap_cfg.per_module_cache_limit
+    warn_ratio = cap_cfg.cap_warn_ratio
+    emergency_ratio = cap_cfg.cap_emergency_ratio
+    max_batch_shrink = cap_cfg.max_shrink_module_per_batch
+    module_cap_cache = {}
+    stat_warn_times = 0
+    stat_emergency_times = 0
+    stat_shrink_batch = 0
+    stat_manual_quota_mod = 0
+    last_cap_report_ts = NOW()
 
-    // 初始化填充各层级默认配额
-    FOR layer IN ["L1","L2","L3","L4","L5"]:
-        layer_cap_cache[layer] = {
-            "used_kb": 0,
-            "total_quota_kb": layer_quota_base[layer].default_cap,
-            "item_count": 0,
-            "warn_ratio": layer_quota_base[layer].warn_ratio,
-            "emergency_ratio": layer_quota_base[layer].emergency_ratio
-        }
-    internal_state = STATE_READY
-
-    WHILE 系统运行中:
-        // 1. 最高优先级：全局熔断调度
-        IF 收到全局调度指令:
-            cmd = 获取调度指令
-            IF cmd == "FUSE":
+    WHILE 系统进程存活:
+        now_ts = NOW()
+        // 1. 最高优先级：全局熔断调度指令处理
+        IF 收到全局调度熔断指令:
+            fuse_cmd = 获取指令
+            old_state = internal_state
+            if fuse_cmd == "FUSE" or fuse_cmd == "PAUSE":
                 internal_state = STATE_PAUSED
+                module_cap_cache.clear()
+                send_audit_log(target="ag-mem-51", log_data=build_cap_state_audit(old_state, internal_state, "熔断暂停全局容量汇总", now_ts))
                 CONTINUE
-            IF cmd == "RESUME" AND internal_state == SYSTEM_PAUSED:
-                internal_state = STATE_READY
+            elif fuse_cmd == "RESUME" and internal_state == SYSTEM_PAUSED:
+                internal_state = CAP_IDLE
+                send_audit_log(target="ag-mem-51", log_data=build_cap_state_audit(old_state, internal_state, "熔断恢复容量管控", now_ts))
 
-        // 2. 接收分层存储定时容量上报
-        IF 收到分层容量占用上报:
-            cap_report = 获取容量上报数据包
-            target_layer = cap_report.层级
-            slot_id = cap_report.分槽ID
-            used_kb = cap_report.当前占用KB
-            item_cnt = cap_report.条目总数
-            internal_state = STATE_CALC_STAT
+        // 熔断状态仅接收上报，跳过批量汇总计算
+        IF internal_state == SYSTEM_PAUSED:
+            IF 收到模块资源占用上报:
+                cap_report = 获取模块上报结构体
+                module_cap_cache[cap_report.module_id] = cap_report
+            SLEEP 10ms
+            CONTINUE
 
-            // 更新缓存内该层级实时占用数据
-            layer_cap_cache[target_layer]["used_kb"] = used_kb
-            layer_cap_cache[target_layer]["item_count"] = item_cnt
-            total_quota = layer_cap_cache[target_layer]["total_quota_kb"]
-            warn_r = layer_cap_cache[target_layer]["warn_ratio"]
-            emer_r = layer_cap_cache[target_layer]["emergency_ratio"]
-            occupy_ratio = used_kb / total_quota
-
-            // 分层级判定预警逻辑
-            IF target_layer == "L5":
-                // L5仅记录告警日志，不触发自动清理
-                IF occupy_ratio >= warn_r:
-                    write_cap_audit_log(event_type="L5容量预警", layer=target_layer, ratio=occupy_ratio, ts=NOW())
-                internal_state = STATE_READY
+        // 2. 处理人工配额修改指令（最高优先级业务）
+        IF 收到运维配额手动调整指令:
+            manual_op = 获取配额修改指令
+            // 双重管理员凭证校验
+            if not admin_double_challenge_check(manual_op.admin_id, manual_op.challenge_code):
+                send_quota_reject(target="运维后台", reason="双重身份校验失败")
                 CONTINUE
-
-            // L1-L4 预警判定
-            internal_state = STATE_ALERT_SEND
-            IF occupy_ratio >= emer_r:
-                // 紧急溢出：加急刷新 + 容量紧急扫描标记
-                send_emergency_refresh_cmd(target_layer=target_layer, force_L4=True)
-                send_cap_emergency_tag(target_layer=target_layer, trigger_cause="capacity_emergency")
-                stat_emergency_alert += 1
-                write_cap_audit_log(event_type="容量紧急溢出", layer=target_layer, ratio=occupy_ratio, ts=NOW())
-            ELIF occupy_ratio >= warn_r:
-                // 普通预警：仅下发加急刷新
-                send_warn_refresh_cmd(target_layer=target_layer, force_L4=False)
-                write_cap_audit_log(event_type="容量预警", layer=target_layer, ratio=occupy_ratio, ts=NOW())
-            internal_state = STATE_READY
-
-        // 3. 接收ag-mem-42清理释放空间同步通知
-        IF 收到清理释放空间同步通知:
-            free_notify = 获取释放通知
-            target_layer = free_notify.目标层级
-            free_kb = free_notify.本次释放KB
-            // 扣减层级占用容量
-            layer_cap_cache[target_layer]["used_kb"] -= free_kb
-            write_cap_audit_log(event_type="清理释放容量", layer=target_layer, free_kb=free_kb, ts=NOW())
-
-        // 4. 处理人工配额调整指令
-        IF 收到人工配额调整指令:
-            quota_req = 获取配额调整指令
-            admin_id = quota_req.管理员ID
-            modify_layer_list = quota_req.层级/分槽ID列表
-            new_total_cap = quota_req.新容量上限KB
-            internal_state = STATE_LOAD_CFG
-
-            // 管理员双重确认校验
-            double_check = launch_admin_double_verify(admin_id, timeout=60*1000, code=quota_req.挑战码)
-            IF NOT double_check.通过:
-                send_quota_reject_notify(target=人工运维接口, reason="双重确认校验失败")
-                internal_state = STATE_READY
+            target_id = manual_op.target_id
+            new_limit = manual_op.new_cap_limit
+            // 校验不可低于保底容量
+            min_guarantee = cap_cfg.get_min_guarantee(target_id)
+            if new_limit < min_guarantee:
+                send_quota_reject(target="运维后台", reason=f"配额不可低于保底容量{min_guarantee}")
                 CONTINUE
+            // 更新本地配额映射
+            old_limit = module_cache_max_map.get(target_id, min_guarantee)
+            module_cache_max_map[target_id] = new_limit
+            stat_manual_quota_mod += 1
+            // 广播新版配额至目标模块
+            send_new_quota_notify(target=target_id, new_limit=new_limit)
+            // 写入配额修改审计日志
+            quota_audit = build_manual_quota_audit(manual_op, old_limit, new_limit, now_ts)
+            send_audit_log(target="ag-mem-51", log_data=quota_audit)
 
-            // 配额合法性校验
-            verify_pass = True
-            verify_msg = ""
-            FOR layer IN modify_layer_list:
-                IF layer == "L5" AND new_total_cap < layer_cap_cache[layer]["total_quota_kb"]:
-                    verify_pass = False
-                    verify_msg = "L5核心层配额禁止下调，仅允许扩容"
-                ELIF new_total_cap < layer_quota_base["global_min_safe_cap"]:
-                    verify_pass = False
-                    verify_msg = "调整后容量低于系统最小安全配额"
-            IF NOT verify_pass:
-                send_quota_reject_notify(target=人工运维接口, reason=verify_msg)
-                internal_state = STATE_READY
-                CONTINUE
+        // 3. 接收各模块定时资源占用上报
+        IF 收到模块资源占用定时上报:
+            cap_report = 获取上报结构体
+            module_cap_cache[cap_report.module_id] = cap_report
 
-            // 更新内存配额并持久化
-            FOR layer IN modify_layer_list:
-                old_cap = layer_cap_cache[layer]["total_quota_kb"]
-                layer_cap_cache[layer]["total_quota_kb"] = new_total_cap
-            persist_save_all_layer_quota(layer_cap_cache)
-            stat_quota_modify += 1
+        // 4. 定时全局容量聚合汇总判定
+        IF internal_state == CAP_IDLE and (now_ts - last_cap_report_ts) >= cap_cfg.cap_scan_interval:
+            internal_state = METRIC_FETCH
+            // 聚合全局内存、分层存储占用
+            global_total_used_mem = sum_all_module_cache(module_cap_cache)
+            layer_used_map = aggregate_layer_storage_usage(module_cap_cache)
+            internal_state = QUOTA_CALC
+            warn_slot_list = []
+            emergency_slot_list = []
+            shrink_module_list = []
+            // 分层存储水位判定
+            for layer, used in layer_used_map.items():
+                max_layer = layer_storage_max[layer]
+                usage_ratio = used / max_layer
+                if usage_ratio >= emergency_ratio:
+                    emergency_slot_list.append({"layer": layer, "ratio": usage_ratio})
+                elif usage_ratio >= warn_ratio:
+                    warn_slot_list.append({"layer": layer, "ratio": usage_ratio})
+            // 单模块缓存超限判定
+            for mid, cap_data in module_cap_cache.items():
+                max_cache = module_cache_max_map.get(mid, cap_cfg.default_module_cache)
+                if cap_data.cache_used_kb > max_cache:
+                    shrink_module_list.append({"module_id": mid, "current": cap_data.cache_used_kb, "limit": max_cache})
+            // 全局总内存判定
+            global_usage_ratio = global_total_used_mem / global_total_mem_quota
+            if global_usage_ratio >= emergency_ratio:
+                emergency_slot_list.append({"global": True, "ratio": global_usage_ratio})
+            elif global_usage_ratio >= warn_ratio:
+                warn_slot_list.append({"global": True, "ratio": global_usage_ratio})
 
-            // 生成配额变更回执、审计日志
-            finish_ack = build_quota_modify_ack(modify_layers=modify_layer_list, old_cap=old_cap, new_cap=new_total_cap, admin=admin_id)
-            send_quota_ack(target=人工运维接口, ack_data=finish_ack)
-            quota_change_log = build_cap_audit_log(event_type="配额人工调整", layer_list=modify_layer_list, ts=NOW())
-            send_audit_log(target="ag-mem-51", log_data=quota_change_log)
-            internal_state = STATE_READY
-
-        // 5. 每180秒周期上报全局容量统计
-        IF NOW() - last_report_ts >= 180 * 1000:
-            cap_stat_report = build_global_cap_report(
-                current_state=internal_state,
-                layer_cap_snapshot=layer_cap_cache,
-                total_emergency_alert=stat_emergency_alert,
-                total_quota_modify=stat_quota_modify
+            internal_state = ALERT_DISPATCH
+            // 分片下发缓存收缩指令
+            slice_shrink_mod = split_slice(shrink_module_list, max_batch_shrink)
+            for slice_mod in slice_shrink_mod:
+                for mod_info in slice_mod:
+                    shrink_cmd = build_cache_shrink_cmd(mod_info["module_id"], mod_info["limit"])
+                    send_shrink_command(target=mod_info["module_id"], cmd=shrink_cmd)
+            stat_shrink_batch += len(slice_shrink_mod)
+            // 组装全局容量告警报表推送
+            cap_alert_report = build_cap_warn_report(
+                warn_list=warn_slot_list,
+                emergency_list=emergency_slot_list,
+                shrink_mod_list=shrink_module_list,
+                global_usage=global_total_used_mem
             )
-            send_stat_report(target="ag-mem-03", report=cap_stat_report)
-            last_report_ts = NOW()
+            if len(emergency_slot_list) > 0:
+                stat_emergency_times += 1
+                send_alert(target_list=["ag-mem-03", "运维告警面板"], alert_data=cap_alert_report)
+            elif len(warn_slot_list) > 0:
+                stat_warn_times += 1
+                send_alert(target="ag-mem-03", alert_data=cap_alert_report)
+            // 向F0推送全局容量大盘快照
+            full_cap_snapshot = build_global_cap_snapshot(module_cap_cache, module_cache_max_map)
+            send_cap_snapshot(target="ag-mem-01", snap_data=full_cap_snapshot)
+            // 写入容量汇总审计日志
+            audit_log = build_cap_scan_audit(
+                warn_count=len(warn_slot_list),
+                emergency_count=len(emergency_slot_list),
+                shrink_mod_count=len(shrink_module_list),
+                ts=now_ts
+            )
+            send_audit_log(target="ag-mem-51", log_data=audit_log)
+            last_cap_report_ts = now_ts
+            internal_state = CAP_IDLE
+
+        // 5. 60秒自身内存占用上报
+        IF now_ts - last_cap_report_ts >= 60 * 1000:
+            self_cache_kb = calc_cap_metric_cache_size(module_cap_cache, cap_cfg.avg_module_cap_meta_kb)
+            self_cap_report = build_self_cap_report(layer="ag-mem-48", used_kb=self_cache_kb, track_module_count=len(module_cap_cache))
+            // 自身上报逻辑内部闭环，无需外部转发
+            IF now_ts - last_cap_report_ts >= 180 * 1000:
+                runtime_stat = build_cap_runtime_stat(
+                    state=internal_state,
+                    total_warn=stat_warn_times,
+                    total_emergency=stat_emergency_times,
+                    total_shrink_batch=stat_shrink_batch,
+                    manual_quota_mod_count=stat_manual_quota_mod
+                )
+                send_stat_report(target="ag-mem-03", report=runtime_stat)
+            last_cap_report_ts = now_ts
 
         SLEEP 10ms
 ```
@@ -211,56 +224,53 @@ FUNCTION capacity_quota_control_main_loop():
 ## 约束与异常处理
 | 场景 | 处理方式 | 恢复条件 |
 |------|----------|----------|
-| 分层存储长期不上报容量数据 | 标记该层级容量状态异常，日志持续告警，不触发预警指令 | 分层存储恢复定时上报容量数据包 |
-| 人工下调L5容量配额 | 直接拦截，返回校验失败提示 | 管理员上调L5配额或调整其他层级 |
-| 调整配额低于系统全局最小安全容量 | 拒绝修改，返回容量底线限制提示 | 上调配额至安全底线以上重新提交 |
-| 单次配额修改层级超过3个 | 拆分多批次分步调整，或直接拒绝超大批量指令 | 缩减单次修改层级数量至3个以内 |
-| 全局紧急熔断触发 | 停止容量采集、预警下发、配额修改，缓存数据保留 | F0下发RESUME恢复指令 |
-| ag-mem-42释放空间通知数值异常（负数） | 丢弃本条通知，记录异常日志，不修改容量缓存 | 上游ag-mem-42修正空间统计逻辑 |
+| 业务模块连续3轮不上报容量指标 | 标记模块离线告警，保留历史占用数据参与计算，推送提醒至运维面板 | 对应模块恢复定时资源上报 |
+| 批量超限模块超过单次收缩指令上限30个 | 自动分片串行下发收缩指令，防止总线消息拥堵 | 内置分片逻辑自动执行 |
+| 指标缓存内存溢出 | 淘汰最早过期模块上报记录，向运维推送容量管控自身缓存告警 | 清理过期指标、扩容管控内存 |
+| PAUSE半熔断触发全局容量汇总周期 | 跳过批量汇总、告警、收缩下发，仅缓存上报数据 | ag-mem-01下发RESUME解除熔断 |
+| ag-mem-35容量配额配置拉取失败 | 加载内置兜底全局/分层/模块配额继续统计，输出配置缺失告警 | ag-mem-35恢复下发完整容量三维参数 |
+| 人工配额修改数值低于系统保底容量 | 直接驳回修改指令，返回保底容量限制提示 | 管理员上调配额至保底值以上重新提交 |
 
 ## 总线契约
 | 总线 | 操作 | 数据内容 | 权限 | 说明 |
 |------|------|----------|------|------|
-| 内部调度总线 | 读 | 分层容量占用上报数据包 | 只读 | ag-mem-20~28 定时推送 |
-| 内部调度总线 | 读 | 人工配额调整指令 | 只读 | 人工运维配额接口下发 |
-| 内部调度总线 | 读 | 清理释放空间同步通知 | 只读 | ag-mem-42 发送 |
-| 内部调度总线 | 读 | 分层容量阈值配置回执 | 只读 | ag-mem-35 同步 |
-| 内部调度总线 | 读 | 全局调度熔断指令 | 只读 | ag-mem-01 下发 |
-| 内部调度总线 | 写 | 容量加急刷新指令、紧急扫描标记 | 专属写入 | 向 ag-mem-37、ag-mem-40 下发 |
-| 内部调度总线 | 写 | 配额调整完成/拒绝回执 | 专属写入 | 向人工运维接口返回操作结果 |
-| 内部调度总线 | 写 | 容量预警、配额变更审计日志 | 事件写入 | 向 ag-mem-51 推送 |
-| 内部调度总线 | 写 | 全局容量周期统计上报 | 周期写入 | 向 ag-mem-03 推送 |
+| 内部调度总线 | 读 | 各模块资源占用上报、人工配额调整指令、全局熔断指令、容量三维配额配置 | 只读 | 全业务模块、运维后台、ag-mem01、ag-mem35 |
+| 内部业务总线 | 写 | 模块缓存收缩指令、新版配额通知 | 专属写入 | 所有ag-mem业务模块 |
+| 运维告警总线 | 写 | 全局容量预警/紧急溢出告警报表 | 专属写入 | ag-mem-03、运维告警面板 |
+| 内部调度总线 | 写 | 全局容量快照、容量管控审计日志、周期运行统计 | 事件/周期写入 | ag-mem01、ag-mem51、ag-mem03 |
 
-## 安全边界
+## 安全边界（V1.1强制规范）
 | 规则编号 | 内容 |
 |:---:|------|
-| Q-01 | L5核心记忆层级容量预警仅日志记录，禁止下发任何自动清理加急指令，杜绝顶层长效经验被系统自动清除 |
-| Q-02 | L5配额仅支持扩容，不允许缩容，底层硬编码校验，防止人为压缩永久记忆存储空间 |
-| Q-03 | 容量预警、紧急清理标记仅能由本模块统一判定下发，各存储/遗忘模块无自主容量判定逻辑 |
-| Q-04 | 所有分层配额人工修改操作必须管理员双重确认，单次操作独立验证，不可复用历史凭证 |
-| Q-05 | 全部容量预警、配额变更、空间释放事件完整写入ag-mem-51审计日志，留存占用率、变更前后容量对比 |
-| Q-06 | 仅接收ag-mem-20~28标准化容量上报数据包，拒绝其他模块上报容量数据，防止容量统计篡改 |
+| CAP48-01 | 全局总内存、分层存储上限、单模块缓存限额、水位阈值全部取自ag-mem-35，本地禁止硬编码任何容量配额参数 |
+| CAP48-02 | 仅下发缓存收缩提示指令，无直接清空模块缓存、删除业务条目、修改分层存储容量的操作权限，资源变更动作收敛至各业务模块自身执行 |
+| CAP48-03 | 人工调整配额强制双重管理员凭证校验，设置最低保底容量锁死，防止人为调低配额导致业务卡死 |
+| CAP48-04 | 熔断分级关停批量容量汇总与收缩下发，故障期间减少大批量总线交互，避免通信资源耗尽 |
+| CAP48-05 | 收缩指令分片限流，单次最多推送30个模块，平滑总线消息负载，保障业务读写指令优先传输 |
+| CAP48-06 | 熔断清空指标缓存，恢复后重新接收实时上报数据计算水位，避免基于过期占用数据误下发收缩指令 |
 
 ## 接口校验用例
 | 用例编号 | 前置条件 | 输入 | 预期输出 |
 |----------|----------|------|----------|
-| TC-M48-01 | `CAP_MONITOR_READY`，L1占用率82% | L1分层容量上报，占用达到预警阈值 | 向ag-mem-37下发常规加急刷新指令，生成容量预警日志 |
-| TC-M48-02 | `CAP_MONITOR_READY`，L3占用率96% | L3容量上报达到紧急溢出阈值 | 下发加急指令+向ag-mem-40推送容量紧急标记，紧急告警计数+1 |
-| TC-M48-03 | `CAP_MONITOR_READY`，L5占用率96% | L5容量上报触发预警占比 | 仅生成预警审计日志，不下发任何清理加急指令 |
-| TC-M48-04 | `CAP_MONITOR_READY`，管理员提交L5配额下调指令 | 人工配额调整指令，缩小L5总容量 | 校验拦截，返回L5禁止缩容提示 |
-| TC-M48-05 | `CAP_MONITOR_READY`，ag-mem-42同步释放1024KB空间 | 清理释放空间同步通知 | 对应层级占用容量缓存扣减，记录释放日志 |
-| TC-M48-06 | `CAP_MONITOR_READY`，接收全局FUSE熔断指令 | 紧急调度熔断指令 | 切换SYSTEM_PAUSED，停止所有容量采集与预警下发 |
+| TC-M48-01 | `CAP_IDLE`，多个模块缓存占用超出单模块配额上限 | 多模块定时容量上报 | 拆分分片下发缓存收缩指令，生成容量预警报表推送ag-mem-03，写入容量审计日志 |
+| TC-M48-02 | `CAP_IDLE`，L3分层存储占用达到紧急溢出水位 | 分层存储占用上报指标 | 标记全局紧急告警，推送高危告警至运维面板，触发大规模清理调度信号 |
+| TC-M48-03 | `CAP_IDLE`，运维下发合法双重校验码的模块配额上调指令 | 人工配额修改指令 | 更新模块配额映射，向目标模块推送新版配额通知，记录配额变更审计日志 |
+| TC-M48-04 | `CAP_IDLE`，超限模块共36个超出单批30个上限 | 超大批量超限模块上报数据 | 自动拆分为两批串行下发收缩指令，无总线拥堵 |
+| TC-M48-05 | `CAP_IDLE`，收到F0 PAUSE半熔断后到达容量汇总周期 | 半熔断+定时汇总触发 | 跳过批量水位计算、告警、收缩下发，仅缓存模块上报数据 |
+| TC-M48-06 | `CAP_IDLE`，收到F0 FUSE全熔断指令 | 全局全熔断调度指令 | 切换SYSTEM_PAUSED，清空指标缓存，关闭所有容量告警与收缩下发逻辑 |
 
 ## 质量自检清单
 | 检查项 | 状态 |
 |--------|:---:|
-| 模块编号、全局容量管控中枢定位匹配V1.1白皮书 | ✅ |
-| 上下游依赖、被依赖模块编号完整无遗漏 | ✅ |
-| 5种内部状态、完整切换触发条件定义清晰 | ✅ |
-| 全部输入输出附带结构体、收发模块、优先级字段 | ✅ |
-| 分层配额标准、预警/紧急判定、L5专属保护规则完整 | ✅ |
-| 伪代码覆盖容量上报、占用率计算、分级预警、空间释放同步、配额修改、审计日志、周期上报全链路 | ✅ |
-| 异常场景覆盖上报失联、L5缩容拦截、容量底线校验、批量超限、熔断、异常释放数值共6类 | ✅ |
-| 内部调度总线读写权限划分清晰统一 | ✅ |
-| 6条V1.1强制安全约束无自动误删顶层记忆漏洞 | ✅ |
-| 6条自动化测试用例覆盖全部核心业务分支 | ✅ |
+| 模块编号ag-mem-48匹配白皮书全局容量配额管控中枢定位 | ✅ |
+| 上下游依赖对齐通用版ag-mem-35容量三维配额参数，链路无冲突 | ✅ |
+| 4种业务状态+暂停状态，覆盖指标聚合、水位判定、告警收缩下发全流程 | ✅ |
+| 输入输出完整标注收发模块、结构体、优先级，数据流无错乱 | ✅ |
+| 三级水位、分层/模块双重配额、人工配额校验、分片限流、熔断降级规则严格对齐V1.1全局配置规范 | ✅ |
+| 伪代码覆盖模块容量上报、人工配额修改、全局聚合水位判定、收缩指令分片下发、告警推送、审计日志全链路 | ✅ |
+| 异常场景包含模块离线上报、超大批量收缩、缓存溢出、半熔断拦截、配置缺失、配额过低拦截共6类全覆盖 | ✅ |
+| 总线读写权限隔离，仅下发收缩提示，无直接清理业务数据权限 | ✅ |
+| 6条V1.1安全约束统一配额管控、权限隔离、人工操作强校验、故障限流、防消息风暴、规避过期指标判定 | ✅ |
+| 6条自动化测试用例覆盖全部容量管控核心业务场景 | ✅ |
+
+---
