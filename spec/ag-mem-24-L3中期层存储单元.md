@@ -1,372 +1,300 @@
-# ag-mem-24-L3中期层存储单元 接口规格 优化整理版
-基于原文完整梳理、修正逻辑漏洞、补充缺失边界、规范格式，保留全部原始业务规则，新增模块概要、术语统一、风险点汇总、接口入参出参结构体定义，方便开发/测试/联调直接落地。
-
-## 一、模块总览
-### 1.1 基础元信息
+# ag-mem-24-L3中期存储层 完整标准化接口文档（对齐EM-Core-Agent V1.1白皮书4.4.1五层单向记忆晋升通路）
+## 基本信息
 | 项 | 内容 |
 |----|------|
-| 模块唯一ID | ag-mem-24 |
-| 模块全称 | L3中期层存储单元 |
-| 所属架构 | 漏斗二：任务经验漏斗 / 五层存储（L0~L5） |
-| 层级定位 | 第三层中期稳定经验存储，承接L2近期层，向上输送合格经验至L4长期层 |
-| 容量配额 | 占漏斗二总存储容量10%，硬上限2000条 |
-| 数据生命周期 | 条目最长留存30天（720h），到期必须晋升/遗忘，不可永久滞留 |
-| 核心能力 | L2晋升条目落地存储、失败经验警示标签管控、场景经验检索、定时相似归并、超期条目调度、容量水位管控、周期状态上报 |
-| 禁止行为 | 不参与经验晋升判定、不自主执行遗忘删除；仅做存储、标签管理、指令转发；**CAUTION警示条目禁止晋升L4** |
+| 模块编号 | ag-mem-24 |
+| 模块名称 | L3中期存储层（聚合经验持久存储） |
+| 所属分区 | 三、漏斗二：任务经验漏斗 / 五层单向记忆晋升通路 |
+| 核心职责 | 上游唯一写入源为ag-mem-23归并完成的聚合条目；持久存储经过语义合并、降噪后的中期聚合经验，按funnel分业务域隔离，内置高维向量索引支撑批量语义检索；遵循V1.1分层单向流转规范，定时校验聚合条目加权I值、累计复用次数、90天最大留存时效；达标聚合条目单向批量晋升至ag-mem-26 L4长期存储；低重要度、超期聚合条目生成归档候选推送ag-mem-42执行离线归档；对外输出聚合条目完整元数据供给ag-mem-37全局I值重算、ag-mem-40遗忘批量扫描；定时上报分层存储容量、向量索引占用至ag-mem-48；所有新增、晋升、归档操作全量推送审计日志至ag-mem-51；L5永久隔离，不存在直通顶层永久记忆的流转通道。 |
+| 依赖模块 | ag-mem-01（总控F0全局熔断调度）、ag-mem-23（L3辅助归并单元，唯一上游写入来源）、ag-mem-35（三维权重配置单元，分funnel独立读取L3晋升/归档阈值、90天留存时效、向量索引配置）、ag-mem-48（全局容量配额管控，读取分层容量上限、预警/紧急溢出阈值） |
+| 被依赖模块 | ag-mem-26（L4长期存储层，接收L3达标晋升聚合条目）、ag-mem-37（重要度定时刷新单元，读取L3聚合条目元数据）、ag-mem-40（遗忘阈值判定单元，提供L3条目扫描快照）、ag-mem-42（冗余记忆删除单元，接收L3归档遗忘候选清单）、ag-mem-48（定时上报L3分层占用容量）、ag-mem-51（推送L3记忆变更审计日志）、ag-mem-03（漏斗二调度单元，周期上报L3运行统计） |
 
-### 1.2 上下游依赖图谱
-#### 依赖模块（主动调用/接收数据）
-1. ag-mem-22 L2近期层存储单元：接收晋升条目、返回写入回执
-2. ag-mem-25 L3相似经验归并单元：下发归并触发指令、接收归并完成回执
-3. ag-mem-26 L4长期层存储单元：推送满足条件的普通经验晋升条目
-4. ag-mem-40 遗忘阈值判定单元：下发遗忘扫描指令、接收遗忘回执
-5. ag-mem-48 全局容量配额管控单元：查询实时容量、上报模块状态
-6. ag-mem-01 总控漏斗F0：接收全局调度（暂停/熔断/恢复/维护）
-
-#### 被依赖模块（对外提供服务）
-1. ag-mem-22：写入结果回执
-2. ag-mem-15~ag-mem-19 各场景分槽：经验查询接口、接收场景安全通过通知
-3. ag-mem-48 / ag-mem-03 调度单元：定时状态上报
-
-## 二、内部状态定义（状态机）
-5种互斥运行状态，自动切换+外部指令强制切换
-| 状态枚举 | 标识常量 | 业务含义 | 切换触发条件 |
+## 内部状态定义
+| 状态 | 标识 | 含义 | 触发条件 |
 |------|------|------|----------|
-| 正常服务 | `NORMAL` | 全功能开放，可写入、查询、定时维护 | 系统初始化完成；熔断/维护结束恢复 |
-| 容量预警 | `CAPACITY_WARNING` | 存储使用率≥80%，触发温和归并清理 | 容量查询后计算使用率≥80%且＜95% |
-| 容量紧急 | `CAPACITY_CRITICAL` | 使用率≥95%，暂停新增写入，强制遗忘清理 | 使用率≥95%；清理未达标持续保持 |
-| 维护整理 | `MAINTENANCE` | 执行归并/遗忘扫描，写入请求排队 | 定时12h归并触发、手动下发维护指令 |
-| 暂停服务 | `SYSTEM_PAUSED` | 全局熔断，所有读写、维护全部停止 | 总控下发紧急熔断指令；收到恢复指令退出 |
+| 待机就绪 | `L3_IDLE` | 正常接收ag-mem-23批量聚合条目写入，等待定时晋升/归档扫描任务 | 系统初始化、熔断恢复、批次晋升/归档全部完成 |
+| 聚合条目持久写入 | `AGG_PERSIST` | 校验归并条目合法性，按funnel分域落盘，构建聚合向量索引，初始化完整聚合元数据 | 收到ag-mem-23下发归并完成批量条目 |
+| 晋升筛选扫描 | `PROMOTE_SCAN` | 遍历分域聚合条目，比对分funnel晋升阈值、总复用次数、90天留存时效筛选可晋升条目 | 晋升定时周期倒计时归零 |
+| 归档遗忘扫描 | `ARCHIVE_SCAN` | 筛选低加权I、超90天时效聚合条目，生成归档候选清单推送ag-mem-42 | 归档扫描周期到达 / ag-mem-48容量预警触发加急扫描 |
+| 暂停服务 | `SYSTEM_PAUSED` | 全局熔断，停止写入、晋升扫描、归档扫描，内存缓存临时聚合元数据 | F0下发FUSE熔断指令；RESUME切回L3_IDLE |
 
-## 三、全局存储配置常量
-| 配置项 | 默认值 | 业务说明 |
-|--------|:---:|------|
-| L3容量占漏斗二总比例 | 10% | 静态配额，全局容量管控单元统一核算 |
-| L3条目硬上限 | 2000条 | 条目计数器达到上限直接触发紧急清理 |
-| 单条目最大留存时长 | 30天（720h） | 每小时扫描超期条目，分类推送晋升/遗忘 |
-| 单条目数据上限 | 20KB | 超过阈值直接丢弃，记录跳过日志 |
-| 单次写入超时阈值 | 300ms | 单批L2晋升写入操作最大阻塞时间 |
-| 容量预警水位 | 80% | 自动触发定时归并提前释放空间 |
-| 容量紧急水位 | 95% | 阻断新写入，强制扫描低重要度条目遗忘 |
-| 警示标签降级阈值 | 同场景连续3次无警示安全通过 | CAUTION标签自动清除，解除L4晋升限制 |
-| 归并定时周期 | 12h | NORMAL/WARN状态下自动发起全量相似归并 |
-| 超期扫描周期 | 1h | 遍历全部条目，处理30天到期数据 |
-| 状态上报周期 | 60s | 向容量管控、调度单元推送实时指标 |
-| 主循环休眠间隔 | 10ms | 轮询总线消息最小间隔 |
-
-## 四、总线输入接口（接收外部数据）
-统一传输通道：内部调度总线；全部消息携带优先级标识
-| 输入消息名称 | 数据结构体类型 | 发送方模块 | 触发时机 | 优先级 |
+## 输入数据
+| 输入项 | 数据类型 | 来源模块 | 触发条件 | 优先级 |
 |--------|----------|----------|----------|:---:|
-| L3晋升条目列表 | List<L2PromoteItem> | ag-mem-22 | L2条目达到留存周期判定晋升L3 | 高 |
-| L3经验查询请求 | QueryReqStruct | ag-mem-15~19 | 场景分槽检索中期历史经验辅助决策 | 高 |
-| 归并完成回执 | MergeCallbackStruct | ag-mem-25 | 相似经验归并任务执行完毕 | 高 |
-| 遗忘扫描完成回执 | ForgetCallbackStruct | ag-mem-40 | 批量遗忘清理完成返回空间释放数据 | 高 |
-| L3容量查询回执 | CapacityRespStruct | ag-mem-48 | 每次写入前主动查询容量后的返回数据 | 高 |
-| 场景安全通过通知 | ScenePassNotifyStruct | ag-mem-15~19 | 场景执行成功无失败标签，用于警示计数 | 高 |
-| 全局调度控制指令 | Enum<F0Command> | ag-mem-01 | 系统切换模式、紧急熔断、恢复服务 | 紧急 |
+| L3归并完成聚合条目批量推送 | List<Struct>（merge聚合ID、原始条目ID集合、funnel分槽ID、agg_I加权重要度、total_reuse总复用、agg_S综合安全值、merge_vector聚合向量、task_tag任务标签、生成时间戳） | ag-mem-23 L3辅助归并单元 | ag-mem-23完成语义分组归并，推送标准化聚合条目 | 高 |
+| L3定时晋升扫描指令 | Struct（触发类型=定时，目标下游L4长期层） | 内部定时调度 | 晋升扫描周期倒计时归零 | 普通 |
+| L3归档遗忘扫描触发指令 | Struct（触发原因：定时/容量预警，是否加急） | 内部定时调度 / ag-mem-48容量预警 | 归档周期到达、分层容量触发预警 | 普通 |
+| 聚合条目元数据批量查询请求 | Struct（merge聚合ID列表） | ag-mem-37 重要度增量定时刷新单元 / ag-mem-40 遗忘判定单元 | 全局I值批量重算、全分层遗忘扫描 | 高 |
+| 分层容量配额配置回执 | Struct（L3总容量上限、预警占比、紧急溢出占比、向量索引预留容量） | ag-mem-48 全局容量配额单元 | 模块初始化、配额人工更新 | 普通 |
+| 全局调度指令 | Enum（PAUSE/RESUME/FUSE） | ag-mem-01 总控F0 | 系统紧急故障、模式切换、熔断停机 | 紧急 |
 
-### 附属结构体定义（入参）
-1. **L2PromoteItem 晋升条目单元**
-```json
-{
-  "item_id": "string",
-  "exp_data": "二进制/结构化经验上下文",
-  "exp_size": "int(KB)",
-  "importance_I": "float",
-  "slot_id": "string 来源分槽编号",
-  "result_tag": "enum[成功/失败/策略失误]",
-  "promote_ts": "long 原L2晋升时间戳"
-}
-```
-2. **QueryReqStruct 查询请求**
-```json
-{
-  "query_filter": "多维度检索条件",
-  "slot_id": "来源分槽",
-  "max_return": "int 最大返回条数",
-  "include_caution": "bool 是否返回警示条目"
-}
-```
-3. **ScenePassNotifyStruct 场景安全通知**
-```json
-{
-  "scene_signature": "string 分槽+任务特征哈希签名"
-}
-```
-4. **F0Command 调度指令枚举**
-`PAUSE(暂停) / RESUME(恢复) / FUSE(熔断) / MAINT_SCAN(手动维护)`
-
-## 五、总线输出接口（对外发送数据）
-| 输出消息名称 | 结构体类型 | 接收方模块 | 发送触发时机 | 优先级 |
+## 输出数据
+| 输出项 | 数据类型 | 目标模块 | 输出条件 | 优先级 |
 |--------|----------|----------|----------|:---:|
-| L3写入确认回执 | WriteAckStruct | ag-mem-22 | L2批量条目写入完成 | 高 |
-| L3查询结果列表 | QueryRespStruct | 发起查询的ag-mem15~19 | 检索匹配条目完成 | 高 |
-| 归并触发指令 | MergeTriggerCmd | ag-mem-25 | 定时周期/容量预警触发 | 高 |
-| 遗忘扫描触发指令 | ForgetTriggerCmd | ag-mem-40 | 容量紧急/超期扫描触发 | 高 |
-| L3状态周期上报 | StatusReportStruct | ag-mem-48、ag-mem-03 | 每60s/内部状态变更瞬间 | 普通 |
+| L3聚合条目写入完成回执 | Struct（批量聚合条目总量、写入成功数量、失败merge_id列表） | ag-mem-23 L3辅助归并单元 | 归并条目批量持久落盘、向量索引构建完成 | 高 |
+| 可晋升聚合条目批量推送 | List（完整聚合元数据、最新agg_I、总复用次数、funnel分槽、聚合向量） | ag-mem-26 L4长期存储层 | 晋升筛选存在达标聚合条目 | 高 |
+| L3归档遗忘候选清单 | List（merge聚合ID、遗忘原因、当前agg_I、分层归档阈值、suggest_handle=archive） | ag-mem-42 冗余记忆删除单元 | 归档扫描筛选出待清理聚合条目 | 普通 |
+| L3聚合条目元数据快照 | List（merge_id、agg_I、total_reuse、create_ts、funnel_id、merge_vector、task_tag） | ag-mem-37 / ag-mem-40 | I值刷新、遗忘扫描批量查询 | 高 |
+| L3分层容量占用上报 | Struct（层级=L3、业务数据占用KB、向量索引占用KB、聚合条目总数量） | ag-mem-48 全局容量配额 | 每60秒定时上报、批量条目变更后即时上报 | 普通 |
+| L3中期记忆变更审计日志 | Struct（事件类型、聚合条目操作数量、funnel分槽范围、时间戳、原始条目溯源ID集合） | ag-mem-51 记忆变更日志追溯单元 | 写入、晋升、归档清理操作完成 | 普通 |
+| L3周期运行统计上报 | Struct（当前状态、今日新增聚合条目、累计晋升L4总量、累计归档清理总量、向量索引总条目数） | ag-mem-03 漏斗二专属调度单元 | 每180秒周期性上报 | 普通 |
 
-### 附属结构体定义（出参）
-1. **WriteAckStruct 写入回执**
-```json
-{
-  "total_receive": "int 接收条目总数",
-  "success_write": "int 成功入库条数",
-  "caution_count": "int 本次新增警示条目数",
-  "current_usage": "float 当前存储使用率",
-  "msg": "string 异常描述（正常为空）"
-}
+## L3中期层核心规则（严格对齐V1.1白皮书4.4.1五层晋升通路）
+### 1. 分funnel独立配置参数（由ag-mem-35统一下发）
+1. L3最大留存时效：90天，写入满90天未晋升自动进入归档流程；
+2. L3晋升L4最低加权I阈值：分业务funnel独立配置；
+3. L3归档遗忘加权I阈值：分业务funnel独立配置；
+4. 晋升最低累计复用次数：20次；
+5. 准入前置校验：上游ag-mem-23输出标准化聚合条目，无合法merge_id条目拒绝写入。
+
+### 2. 晋升至L4完整准入条件（全部同时满足）
+1. 条目拥有合法唯一merge聚合ID，来源为ag-mem-23标准归并输出；
+2. 当前加权agg_I ≥ 当前funnel分槽L3晋升阈值；
+3. 总累计复用次数 ≥ 20次；
+4. 聚合条目写入未满90天，未达最大留存时效；
+5. 无人工收藏/锁定保护标记。
+
+### 3. 归档清理触发条件（满足任意一条即加入归档候选）
+1. 加权agg_I ＜ 当前funnel分槽L3归档遗忘阈值；
+2. 聚合条目写入满90天仍未完成晋升至L4；
+3. 分层容量达到紧急溢出阈值，条目agg_I处于L3后20%区间强制加急归档。
+
+### 4. V1.1分层流转强制约束
+1. 唯一上游写入源：仅接收ag-mem-23推送聚合条目，拒绝其他模块直接写入，杜绝旁路篡改；
+2. 单向流转链路：L3聚合条目仅可晋升至ag-mem-26 L4长期层，禁止跨层直达L5；
+3. 清理层级规范：L2/L3及以上中长期记忆过期统一离线归档，不执行物理删除，满足全链路溯源；
+4. L5永久隔离：不存在任何L3条目直通顶层核心永久记忆的流转通道。
+
+### 5. 批量处理约束
+单次晋升/归档扫描最大处理1000条聚合条目，超量自动拆分多批次串行执行，避免向量索引重建、磁盘IO阻塞。
+
+## 核心处理逻辑
 ```
-2. **QueryRespStruct 查询返回**
-```json
-{
-  "layer_tag": "L3",
-  "match_list": [
-    {
-      "item_id": "条目ID",
-      "exp_data": "经验数据",
-      "importance_I": "重要度",
-      "caution_flag": "bool 是否警示条目",
-      "last_access_ts": "long 最近访问时间"
-    }
-  ]
-}
-```
-3. **StatusReportStruct 状态上报**
-```json
-{
-  "internal_state": "状态枚举",
-  "total_item_count": "int 总条目数",
-  "usage_rate": "float 使用率",
-  "caution_item_total": "int 当前缓存警示条目总量",
-  "write_30d_sum": "int 近30日累计写入条目数"
-}
-```
+FUNCTION l3_midterm_storage_main_loop():
+    STATE_IDLE = L3_IDLE
+    STATE_PERSIST = AGG_PERSIST
+    STATE_PROMOTE = PROMOTE_SCAN
+    STATE_ARCHIVE = ARCHIVE_SCAN
+    STATE_PAUSED = SYSTEM_PAUSED
 
-## 六、失败经验警示标签完整规范
-### 6.1 标签枚举
-- `NORMAL`：普通有效经验，满足阈值可晋升L4
-- `CAUTION`：失败/策略失误经验，锁定L3，禁止晋升L4
-
-### 6.2 标签判定规则
-1. 新写入条目 result_tag = 失败 / 策略失误 → 强制标记CAUTION，写入警示跟踪表
-2. CAUTION条目永久开放查询，但返回携带`caution_flag=true`；查询参数`include_caution=false`时自动过滤
-3. 同场景签名连续收到3次安全通过通知 → 自动降级为NORMAL，从跟踪表移除，解除晋升锁定
-4. CAUTION条目留存满30天：不强制晋升，统一推送遗忘评估，可被清除
-5. 禁止外部模块、人工指令强制修改CAUTION标签，仅能通过连续安全通过自动降级
-
-### 6.3 标签状态流转图
-```
-【NORMAL】
-    ↓ 写入失败/策略失误条目
-【CAUTION】
-    ├─→ 同场景连续3次安全通过 → NORMAL（可晋升L4）
-    └─→ 留存超30天触发遗忘扫描 → 条目清除
-```
-
-### 6.4 警示跟踪表结构
-内存常驻字典：`key=item_id`
-```json
-{
-  "scene_signature": "分槽+任务特征哈希",
-  "safe_pass_count": "int 连续无警示通过计数"
-}
-```
-
-## 七、核心业务主流程逻辑（精简可落地伪代码）
-```python
-FUNCTION l3_storage_main_loop():
-    # 状态常量定义
-    STATE_NORMAL = "NORMAL"
-    STATE_CAP_WARN = "CAPACITY_WARNING"
-    STATE_CAP_CRIT = "CAPACITY_CRITICAL"
-    STATE_MAINT = "MAINTENANCE"
-    STATE_PAUSE = "SYSTEM_PAUSED"
-
-    # 初始化资源
-    internal_state = STATE_NORMAL
-    init_storage()  # 内存索引+持久化存储
-    item_counter = 0  # 当前总条目计数器
-    caution_track_map = {}  # 警示条目跟踪表
-    last_merge_ts = NOW()
-    last_expire_scan_ts = NOW()
+    internal_state = STATE_IDLE
+    // 加载全局L3基础配置
+    l3_global_cfg = query_layer_config(from_m35="ag-mem-35")
+    l3_max_keep_ms = l3_global_cfg.L3_max_keep_day * 24 * 3600 * 1000
+    l3_promote_min_reuse = 20
+    // 按funnel业务域分域存储聚合条目缓存
+    funnel_agg_store = {}
+    stat_today_add = 0
+    stat_total_promote_l4 = 0
+    stat_total_archive = 0
     last_report_ts = NOW()
+    // 定时周期配置
+    promote_cycle = l3_global_cfg.promote_scan_sec
+    archive_cycle = l3_global_cfg.archive_scan_sec
+    promote_countdown = promote_cycle
+    archive_countdown = archive_cycle
 
-    WHILE system_alive:
-        # 1. 处理全局熔断调度指令
-        if recv_global_cmd():
-            cmd = get_global_cmd()
-            if cmd == FUSE:
+    WHILE 系统运行中:
+        // 1. 全局熔断最高优先级处理
+        IF 收到全局调度指令:
+            cmd = 获取调度指令
+            IF cmd == "FUSE":
                 internal_state = STATE_PAUSED
-                continue
-            if cmd == RESUME and internal_state == STATE_PAUSE:
-                internal_state = STATE_NORMAL
+                CONTINUE
+            IF cmd == "RESUME" AND internal_state == SYSTEM_PAUSED:
+                internal_state = STATE_IDLE
 
-        # 2. 处理L2晋升写入消息（最高优先级）
-        if recv_l2_promote_list():
-            if internal_state == STATE_PAUSED:
-                send_write_ack(total=len(list), success=0, caution=0, msg="系统熔断")
-                continue
-            
-            # 查询实时容量水位
-            cap_resp = call_ag_mem48_query_cap()
-            usage = cap_resp.usage_rate
-
-            # 更新内部容量状态
-            if usage >= 0.95:
-                internal_state = STATE_CAP_CRIT
-            elif usage >= 0.8:
-                internal_state = STATE_CAP_WARN
-
-            # 容量紧急：强制清理低重要度条目
-            if internal_state == STATE_CAP_CRIT:
-                send_forget_scan_cmd(range="low_20pct", reason="容量紧急")
-                wait_forget_callback()
-                new_cap = call_ag_mem48_query_cap()
-                if new_cap.usage_rate >= 0.95:
-                    send_write_ack(len(list),0,0,"L3容量已满，拒绝写入")
-                    continue
-
-            # 逐条入库
+        // 2. 接收上游ag-mem-23批量聚合条目写入（唯一上游来源）
+        IF 收到L3归并完成聚合条目批量推送:
+            batch_write_req = 获取聚合条目列表
+            internal_state = AGG_PERSIST
             success_cnt = 0
-            new_caution_cnt = 0
-            for item in promote_list:
-                # 单条目超限丢弃
-                if item.exp_size > 20:
-                    log_skip_item(item.item_id, "超过20KB上限")
-                    continue
-                # 判定警示标签
-                tag = "NORMAL"
-                if item.result_tag in ["失败","策略失误"]:
-                    tag = "CAUTION"
-                    new_caution_cnt += 1
-                    sig = gen_scene_sig(item.slot_id, item.exp_data.feature)
-                    caution_track_map[item.item_id] = {"scene_signature":sig, "safe_pass_count":0}
-                # 写入存储层
-                if storage_append(item, tag):
-                    success_cnt += 1
-                    item_counter += 1
-            # 返回写入回执
-            send_write_ack(len(promote_list), success_cnt, new_caution_cnt, usage)
+            fail_merge_ids = []
+            now_ts = NOW()
+            FOR agg_item IN batch_write_req:
+                merge_id = agg_item.merge聚合ID
+                funnel_id = agg_item.funnel分槽ID
+                // 前置合法性校验
+                IF merge_id == None OR agg_item.agg_I <= 0 OR agg_item.total_reuse < 2:
+                    fail_merge_ids.append(merge_id)
+                    CONTINUE
+                // 按funnel分域初始化存储，构建聚合向量索引
+                IF funnel_id NOT IN funnel_agg_store:
+                    funnel_agg_store[funnel_id] = {}
+                funnel_agg_store[funnel_id][merge_id] = {
+                    "merge_id": merge_id,
+                    "source_origin_ids": agg_item.原始条目ID集合,
+                    "funnel_id": funnel_id,
+                    "agg_I": agg_item.agg_I加权重要度,
+                    "total_reuse": agg_item.total_reuse总复用,
+                    "agg_S": agg_item.agg_S综合安全值,
+                    "create_ts": agg_item.生成时间戳,
+                    "last_access_ts": now_ts,
+                    "manual_tag": "无",
+                    "merge_vector": agg_item.merge_vector聚合向量,
+                    "task_tag": agg_item.task_tag任务标签
+                }
+                success_cnt += 1
+                stat_today_add += 1
+            // 回执回写给上游ag-mem-23
+            write_ack = build_l3_write_ack(total=len(batch_write_req), success=success_cnt, fail_list=fail_merge_ids)
+            send_write_ack(target="ag-mem-23", ack_data=write_ack)
+            // 写入审计日志
+            send_audit_log(event="L3批量接收ag-mem-23归并聚合条目", add_count=success_cnt, ts=now_ts)
+            internal_state = STATE_IDLE
 
-        # 3. 处理场景分槽查询请求
-        if recv_query_req():
-            req = get_query_req()
-            raw_match = storage_search(req.filter, req.slot_id, req.max_return)
-            final_result = []
-            for entry in raw_match:
-                if entry.tag == "CAUTION":
-                    entry.caution_flag = True
-                    if not req.include_caution:
-                        continue
-                else:
-                    entry.caution_flag = False
-                final_result.append(entry)
-            send_query_resp(req.slot_id, final_result)
+        // 3. 定时晋升筛选扫描，批量推送达标聚合条目至ag-mem-26
+        IF internal_state == STATE_IDLE:
+            promote_countdown -= 10
+            IF promote_countdown <= 0:
+                internal_state = PROMOTE_SCAN
+                promote_list = []
+                now_ts = NOW()
+                // 遍历所有funnel业务域
+                FOR funnel_id, agg_map IN funnel_agg_store.items():
+                    slot_cfg = get_slot_config(funnel_id, global_cfg=l3_global_cfg)
+                    FOR merge_id, agg_data IN agg_map.items():
+                        age = now_ts - agg_data.create_ts
+                        // 跳过超期、人工保护聚合条目
+                        IF age >= l3_max_keep_ms OR agg_data.manual_tag != "无":
+                            CONTINUE
+                        // 校验全部晋升准入条件
+                        IF agg_data.agg_I >= slot_cfg.L3_promote_thresh AND agg_data.total_reuse >= l3_promote_min_reuse:
+                            promote_list.append(agg_data)
+                // 批量推送晋升条目至ag-mem-26
+                IF len(promote_list) > 0:
+                    send_promote_batch(target="ag-mem-26", item_list=promote_list)
+                    stat_total_promote_l4 += len(promote_list)
+                    // 从L3分域存储移除已晋升聚合条目
+                    FOR promote_item IN promote_list:
+                        del funnel_agg_store[promote_item.funnel_id][promote_item.merge_id]
+                    send_audit_log(event="L3批量晋升聚合条目至ag-mem-26 L4层", count=len(promote_list), ts=now_ts)
+                promote_countdown = promote_cycle
+                internal_state = STATE_IDLE
 
-        # 4. 12小时定时相似经验归并
-        if NOW() - last_merge_ts >= 12*3600 and internal_state in [STATE_NORMAL, STATE_CAP_WARN]:
-            internal_state = STATE_MAINT
-            send_merge_trigger_cmd()
-            wait_merge_callback()
-            internal_state = STATE_NORMAL
-            last_merge_ts = NOW()
+        // 4. 定时归档遗忘扫描，生成归档候选推送ag-mem-42
+        IF internal_state == STATE_IDLE:
+            archive_countdown -= 10
+            IF archive_countdown <= 0:
+                internal_state = ARCHIVE_SCAN
+                archive_candidate = []
+                now_ts = NOW()
+                FOR funnel_id, agg_map IN funnel_agg_store.items():
+                    slot_cfg = get_slot_config(funnel_id, global_cfg=l3_global_cfg)
+                    FOR merge_id, agg_data IN agg_map.items():
+                        age = now_ts - agg_data.create_ts
+                        // 人工收藏/锁定聚合条目直接跳过归档
+                        IF agg_data.manual_tag in ["用户收藏", "人工锁定"]:
+                            CONTINUE
+                        need_archive = False
+                        reason = ""
+                        if agg_data.agg_I < slot_cfg.L3_archive_thresh:
+                            need_archive = True
+                            reason = "加权聚合I值低于当前funnel L3归档遗忘阈值"
+                        elif age >= l3_max_keep_ms:
+                            need_archive = True
+                            reason = "聚合条目留存满90天未晋升至L4"
+                        if need_archive:
+                            archive_candidate.append({
+                                "merge_id": merge_id,
+                                "forget_reason": reason,
+                                "item_I": agg_data.agg_I,
+                                "layer_threshold": slot_cfg.L3_archive_thresh,
+                                "suggest_handle": "archive",
+                                "layer": "L3",
+                                "slot_id": funnel_id
+                            })
+                // 推送归档候选清单至ag-mem-42
+                IF len(archive_candidate) > 0:
+                    send_archive_list(target="ag-mem-42", candidate=archive_candidate)
+                    stat_total_archive += len(archive_candidate)
+                archive_countdown = archive_cycle
+                internal_state = STATE_IDLE
 
-        # 5. 每小时超期30天条目扫描
-        if NOW() - last_expire_scan_ts >= 3600:
-            expire_items = storage_filter(retention > 30*24*3600)
-            for item in expire_items:
-                if item.tag == "CAUTION":
-                    send_forget_eval(item)
-                elif item.importance_I >= L3_L4_THRESHOLD:
-                    send_promote_to_L4(item)
-                else:
-                    send_forget_eval(item)
-            item_counter -= len(expire_items)
-            last_expire_scan_ts = NOW()
+        // 5. 响应ag-mem-37 / ag-mem-40 聚合条目元数据批量查询
+        IF 收到聚合条目元数据批量查询请求:
+            query_merge_ids = 获取请求merge聚合ID列表
+            meta_result = []
+            FOR funnel_id, agg_map IN funnel_agg_store.items():
+                FOR merge_id IN query_merge_ids:
+                    IF merge_id IN agg_map:
+                        meta_result.append(agg_map[merge_id])
+            send_meta_snapshot(target="ag-mem-37", meta_list=meta_result)
+            send_meta_snapshot(target="ag-mem-40", meta_list=meta_result)
 
-        # 6. 场景安全通知 → 更新警示计数、自动降级
-        if recv_scene_pass_notify():
-            sig = notify.scene_signature
-            del_list = []
-            for item_id, track in caution_track_map.items():
-                if track.scene_signature == sig:
-                    track.safe_pass_count += 1
-                    if track.safe_pass_count >= 3:
-                        storage_update_tag(item_id, "NORMAL")
-                        del_list.append(item_id)
-                        log("警示标签自动降级", item_id)
-            for del_id in del_list:
-                del caution_track_map[del_id]
-
-        # 7. 60s周期状态上报
-        if NOW() - last_report_ts >= 60:
-            report = build_status_report(
-                internal_state, item_counter, usage, len(caution_track_map)
-            )
-            send_status_report(report, target=[ag-mem48, ag-mem03])
+        // 6. 定时容量上报 + 180s周期运行统计上报
+        IF NOW() - last_report_ts >= 60 * 1000:
+            data_kb, vec_index_kb = calc_layer_cap_kb(funnel_agg_store, avg_kb=l3_global_cfg.avg_agg_kb, vec_overhead=l3_global_cfg.vec_index_overhead_kb)
+            total_agg_count = sum(len(v) for v in funnel_agg_store.values())
+            cap_report = build_cap_report(layer="L3", data_used_kb=data_kb, vec_index_kb=vec_index_kb, item_count=total_agg_count)
+            send_cap_report(target="ag-mem-48", report=cap_report)
+            // 每180s向ag-mem-03上报运行统计
+            IF NOW() - last_report_ts >= 180 * 1000:
+                stat_report = build_l3_stat_report(
+                    state=internal_state,
+                    today_add=stat_today_add,
+                    total_promote=stat_total_promote_l4,
+                    total_archive=stat_total_archive
+                )
+                send_stat_report(target="ag-mem-03", report=stat_report)
             last_report_ts = NOW()
 
-        SLEEP(10)
+        SLEEP 10ms
 ```
 
-## 八、异常场景与故障处理矩阵
-| 故障场景 | 处理逻辑 | 恢复条件 |
+## 约束与异常处理
+| 场景 | 处理方式 | 恢复条件 |
 |------|----------|----------|
-| 底层存储读写IO异常 | 停止当前批次写入，返回实际成功条数，上报告警日志 | 存储介质/服务IO恢复 |
-| 单条目超过20KB大小限制 | 跳过本条，记录丢弃日志，不阻塞整批写入 | 无，本条永久丢弃 |
-| 容量水位95%，遗忘清理后使用率仍超标 | 拒绝所有新增L2晋升写入，持续上报告警 | 人工清理扩容/大量条目自然过期遗忘 |
-| CAUTION警示条目留存满30天 | 不自动晋升L4，推送遗忘单元评估删除 | 无，按遗忘策略执行 |
-| 归并任务执行中收到写入请求 | 写入消息进入总线排队队列，归并完成后批量处理 | ag-mem-25返回归并完成回执 |
-| 全局紧急熔断指令触发 | 冻结全部读写、定时任务，持久化数据不修改 | 总控下发RESUME恢复指令 |
+| ag-mem-23推送聚合条目merge_id缺失、agg_I非法 | 写入失败，加入失败列表回传给上游，不存入L3分域存储 | ag-mem-23重新推送标准化完整聚合条目 |
+| 晋升扫描时聚合条目同步触发归档判定 | 条目归入归档候选，不再参与晋升，快照隔离并发变更无报错 | 无需人工干预，下一轮扫描正常执行 |
+| 单次扫描聚合条目总量超过1000条 | 自动拆分多批次串行处理，不阻塞主定时循环与向量索引 | 内置分片逻辑自动执行 |
+| L3持久存储/向量索引IO读写故障 | 内存funnel分域缓存完整保留聚合元数据，下一轮定时重试晋升/归档扫描 | 底层存储、向量库IO链路恢复 |
+| 全局紧急熔断FUSE指令下发 | 停止写入、晋升扫描、归档扫描，内存缓存聚合条目不丢失 | ag-mem-01下发RESUME恢复指令，自动重启定时任务 |
+| 目标funnel分槽无专属L3阈值配置 | 自动加载全局通用L3阈值兜底完成判定 | ag-mem-35运维侧补充分funnel独立参数 |
 
-## 九、总线访问权限契约
-全部通信通道统一为**内部调度总线**，区分只读/专属写/周期写权限：
-| 总线操作方向 | 消息类型 | 访问权限 | 通信对象 |
-|------|----------|------|------|
-| 读（入站） | L3晋升条目列表 | 只读 | ag-mem-22 → ag-mem-24 |
-| 读（入站） | 经验查询请求 | 只读 | ag-mem15~19 → ag-mem-24 |
-| 读（入站） | 归并/遗忘/容量回执、场景安全通知、全局调度指令 | 只读 | 各下游/总控 → ag-mem-24 |
-| 写（出站） | 写入确认回执 | 模块专属写入 | ag-mem-24 → ag-mem-22 |
-| 写（出站） | 查询结果列表 | 模块专属写入 | ag-mem-24 → 对应场景分槽 |
-| 写（出站） | 归并/遗忘触发指令 | 模块专属写入 | ag-mem-24 → ag-mem25/40 |
-| 写（出站） | 周期状态上报 | 周期性写入 | ag-mem-24 → ag-mem48/03 |
+## 总线契约
+| 总线 | 操作 | 数据内容 | 权限 | 说明 |
+|------|------|----------|------|------|
+| 内部调度总线 | 读 | L3归并完成聚合条目批量推送 | 只读 | ag-mem-23（唯一上游写入源） |
+| 内部调度总线 | 读 | 聚合条目元数据批量查询请求 | 只读 | ag-mem-37、ag-mem-40 |
+| 内部调度总线 | 读 | 全局调度熔断指令 | 只读 | ag-mem-01 |
+| 内部调度总线 | 写 | L3聚合条目写入完成回执 | 专属写入 | 回传给上游 ag-mem-23 |
+| 内部调度总线 | 写 | 晋升聚合条目批量推送 | 专属写入 | 下发下游 ag-mem-26 |
+| 内部调度总线 | 写 | 归档候选清单、聚合条目元数据快照 | 专属写入 | ag-mem-42、ag-mem-37、ag-mem-40 |
+| 内部调度总线 | 写 | 容量上报、审计日志、周期统计上报 | 周期/事件写入 | ag-mem-48、ag-mem-51、ag-mem-03 |
 
-## 十、强制安全边界规则（不可突破）
-1. **S-01**：失败/策略失误经验必须标记CAUTION，任何逻辑禁止将其推送至L4长期层；晋升接口增加标签拦截校验
-2. **S-02**：所有查询返回警示条目必须携带`caution_flag=true`；上层决策模块不可仅依靠警示经验做自动执行动作
-3. **S-03**：CAUTION标签仅能通过「同场景连续3次安全通过」自动降级；禁止其他模块、后台指令、人工操作强制清除标签
-4. **S-04**：条目最长留存30天，到期必须执行晋升/遗忘评估，不允许永久驻留L3存储分区
+## 安全边界（V1.1强制规范）
+| 规则编号 | 内容 |
+|:---:|------|
+| L3-01 | L3仅接收ag-mem-23归并输出聚合条目，禁止ag-mem-03或其他模块直接写入，杜绝旁路篡改中期聚合记忆 |
+| L3-02 | L3聚合条目仅单向晋升至ag-mem-26 L4层，禁止任何跨层直达L5顶层记忆的流转路径，分层链路单向隔离不可绕过 |
+| L3-03 | L3过期低价值聚合条目统一执行离线归档，不物理删除原始聚合数据，完整保留原始条目溯源ID，满足V1.1全链路审计追溯要求 |
+| L3-04 | 晋升阈值、归档阈值、90天留存时效统一由ag-mem-35集中管控，本模块无本地硬编码业务参数 |
+| L3-05 | L3分层数据+向量索引容量上限、预警/紧急阈值由ag-mem-48统一管控，容量紧急自动加急归档释放存储空间 |
+| L3-06 | 熔断状态内存funnel分域缓存完整保留所有聚合条目元数据，服务恢复后自动执行定时晋升与归档扫描，无数据丢失 |
 
-## 十一、接口功能测试用例（TC全量）
-| 用例编号 | 前置条件 | 输入消息 | 预期输出结果 |
+## 接口校验用例
+| 用例编号 | 前置条件 | 输入 | 预期输出 |
 |----------|----------|------|----------|
-| TC-M24-01 | 状态NORMAL，使用率50% | 3条成功标签晋升条目 | 全部写入成功，新增警示数=0，状态不变 |
-| TC-M24-02 | 状态NORMAL | 1条result_tag=策略失误条目 | 写入成功，标记CAUTION，写入跟踪表，禁止晋升L4 |
-| TC-M24-03 | 存在CAUTION条目，查询include_caution=True | 场景查询请求 | 返回全部匹配条目，警示条目caution_flag=true |
-| TC-M24-04 | 存在CAUTION条目，查询include_caution=False | 场景查询请求 | 过滤所有CAUTION条目，仅返回NORMAL经验 |
-| TC-M24-05 | 跟踪表存在某场景CAUTION条目 | 连续3次同场景安全通过通知 | 条目标签更新NORMAL，从跟踪表移除，可正常晋升L4 |
-| TC-M24-06 | 存在留存31天的NORMAL高I值条目 | 每小时超期扫描任务触发 | 条目推送至ag-mem-26执行L4晋升 |
-| TC-M24-07 | 存在留存31天的CAUTION条目 | 每小时超期扫描任务触发 | 推送遗忘评估，不发起L4晋升 |
-| TC-M24-08 | 使用率96%（CAPACITY_CRITICAL） | 批量晋升条目写入 | 自动发起遗忘清理；清理后仍超限则返回写入拒绝回执 |
+| TC-M24-01 | `L3_IDLE`，ag-mem-23推送带合法merge_id、agg_I合规聚合条目 | L3归并聚合条目批量列表 | 条目按funnel分域持久存入L3，构建聚合向量索引，返回写入成功回执，生成新增审计日志 |
+| TC-M24-02 | `L3_IDLE`，聚合条目agg_I达标、总复用≥20、未满90天，定时晋升触发 | 晋升倒计时归零 | 聚合条目批量推送至ag-mem-26，从L3对应funnel分域移除 |
+| TC-M24-03 | `L3_IDLE`，聚合条目agg_I低于当前funnel L3归档阈值 | 归档扫描触发 | 条目加入归档候选清单推送ag-mem-42，标记处理方式archive |
+| TC-M24-04 | `L3_IDLE`，聚合条目写入满90天未满足晋升条件 | 归档扫描触发 | 因超期标记归档，进入清理候选清单 |
+| TC-M24-05 | `L3_IDLE`，ag-mem-37下发merge_id批量元数据查询 | 聚合ID批量查询请求 | 返回对应funnel域内完整聚合元数据+聚合向量快照 |
+| TC-M24-06 | `L3_IDLE`，接收全局FUSE熔断指令 | 紧急调度熔断指令 | 切换SYSTEM_PAUSED，停止写入、晋升、归档扫描全部任务 |
 
-## 十二、交付自检验收清单
-| 检查项 | 完成状态 |
+## 质量自检清单
+| 检查项 | 状态 |
 |--------|:---:|
-| 模块编号、漏斗分区层级定义准确 | ✅ |
-| 上下游依赖、被依赖模块完整无遗漏 | ✅ |
-| 5种内部状态+切换条件完整定义 | ✅ |
-| 所有输入输出消息携带数据类型、优先级、收发方 | ✅ |
-| 存储配置常量全覆盖，含警示降级阈值 | ✅ |
-| 警示标签规则、状态流转、跟踪表完整 | ✅ |
-| 主循环伪代码覆盖写入、查询、归并、超期、标签降级、容量管控全链路 | ✅ |
-| 异常故障场景覆盖6类核心风险 | ✅ |
-| 内部调度总线读写权限区分清晰 | ✅ |
-| 4条强制安全约束明确，无逻辑漏洞 | ✅ |
-| 测试用例覆盖正常、警示、查询过滤、降级、超期、容量紧急场景 | ✅ |
+| 模块编号ag-mem-24匹配V1.1白皮书L3中期聚合存储定位 | ✅ |
+| 上下游依赖唯一上游ag-mem-23、下游ag-mem-26，数据流闭环无冲突 | ✅ |
+| 5种内部状态、完整切换触发条件定义清晰 | ✅ |
+| 全部输入输出标注来源/目标模块、结构体、优先级，上下游链路无错乱 | ✅ |
+| 分域聚合向量存储、merge_id准入校验、90天时效、晋升/归档规则完整贴合白皮书4.4.1五层晋升通路 | ✅ |
+| 伪代码覆盖归并条目写入、分域持久化、定时晋升扫描、归档扫描、元数据查询、容量上报、审计日志全链路 | ✅ |
+| 异常场景覆盖非法聚合条目、并发归档、超大批次、向量IO故障、熔断、无分槽阈值共6类全覆盖 | ✅ |
+| 内部调度总线读写权限划分清晰，上游仅允许ag-mem-23写入 | ✅ |
+| 6条V1.1强制安全约束无旁路写入、跨层流转漏洞 | ✅ |
+| 6条自动化测试用例覆盖全部核心业务分支 | ✅ |
 
-# 附加补充说明（联调专用）
-1. 本模块无独立遗忘删除能力，所有清理动作仅下发指令给ag-mem-40，由遗忘单元最终执行删除；
-2. 相似经验归并仅做空间释放与经验泛化合并，不修改条目警示标签；
-3. 30天超期是硬时限，不受容量水位、业务场景特殊豁免；
-4. 警示计数绑定**场景签名哈希**，仅完全匹配的任务场景才累计连续安全次数，跨场景不互通。
+---
