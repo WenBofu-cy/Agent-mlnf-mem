@@ -1,402 +1,300 @@
-# ag-mem-26-L4长期层存储单元 规整落地版接口规格文档
-承接ag-mem-24、ag-mem-25上下游模块统一架构规范，统一结构体定义、业务链路梳理、消除逻辑歧义，完整保留全部原生业务规则，适配开发编码、联调对接、自动化测试使用。
-
-## 一、模块基础元信息
+# ag-mem-26-L4长期存储层 完整标准化接口文档（对齐EM-Core-Agent V1.1白皮书4.4.1五层单向记忆晋升通路）
+## 基本信息
 | 项 | 内容 |
 |----|------|
-| 模块唯一ID | ag-mem-26 |
-| 模块全称 | L4长期层存储单元 |
-| 所属架构 | 三、漏斗二：任务经验漏斗 / 五层存储（L0~L5） |
-| 层级定位 | 第四层高阶泛化经验存储，承接L3合格无警示经验，向上输送达标经验至L5核心层；承载跨场景通用技能沉淀 |
-| 容量配额 | 占漏斗二总存储容量4.5%，硬上限1000条 |
-| 生命周期规则 | 无固定30天过期时限，默认强遗忘保护；仅I值过低+复用频次不足才会进入遗忘评估 |
-| 核心能力 | L3晋升条目准入校验、用户隐私去个性化清洗、L4专属I值重计算、经验持久存储、分槽同类经验计数、定时/定量触发抽象提炼、经验检索、容量水位管控、周期状态上报 |
-| 禁止行为 | 不参与晋升判定、不自主删除遗忘条目；**禁止CAUTION警示条目入库**；所有入库数据强制脱敏去个性化 |
+| 模块编号 | ag-mem-26 |
+| 模块名称 | L4长期存储层（轻量化长效聚合记忆持久层） |
+| 所属分区 | 三、漏斗二：任务经验漏斗 / 五层单向记忆晋升通路 |
+| 核心职责 | 唯一上游写入源为ag-mem-25轻量化输出条目；持久存储经过多层降噪、轻量化压缩后的长期聚合经验，按funnel分业务域隔离，搭载高压缩向量索引，适配大容量长效记忆存储；遵循V1.1分层单向流转规范，定时校验轻量化条目final_I、累计总复用、365天最大留存时效；达标条目批量推送至ag-mem-27 L4抽象提炼单元做顶层记忆标准化；低价值、超期轻量化条目生成归档候选推送ag-mem-42离线归档；对外输出轻量化条目完整元数据供给ag-mem-37全局I值刷新、ag-mem-40全分层遗忘扫描；定时上报业务数据、向量索引占用容量至ag-mem-48；所有新增、晋升、归档操作全量写入ag-mem-51审计日志；严格隔离L5顶层核心存储，无直接跨层写入通道。 |
+| 依赖模块 | ag-mem-01（总控F0全局熔断调度）、ag-mem-25（L3轻量化归并单元，唯一上游写入源）、ag-mem-35（三维权重配置单元，分funnel独立下发L4晋升/归档阈值、365天留存周期、向量压缩参数）、ag-mem-48（全局容量配额管控，读取L4分层容量上限、预警/紧急溢出阈值） |
+| 被依赖模块 | ag-mem-27（L4抽象提炼单元，接收L4达标轻量化条目）、ag-mem-37（重要度定时刷新单元，读取L4轻量化条目元数据）、ag-mem-40（遗忘阈值判定单元，提供L4条目扫描快照）、ag-mem-42（冗余记忆删除单元，接收L4归档候选清单）、ag-mem-48（接收L4分层容量定时上报）、ag-mem-51（记录L4全部记忆变更审计日志）、ag-mem-03（漏斗二调度单元，周期上报L4运行统计指标） |
 
-### 上下游依赖图谱
-#### 依赖模块（主动调用/接收消息）
-1. ag-mem-24 L3中期存储单元：接收晋升条目、返回写入回执
-2. ag-mem-27 L4经验抽象提炼单元：下发提炼指令、接收提炼完成回执
-3. ag-mem-28 L5核心层存储单元：推送满足门槛的高阶经验晋升条目
-4. ag-mem-40 遗忘阈值判定单元：下发遗忘扫描指令、接收清理回执
-5. ag-mem-48 全局容量配额管控单元：查询实时容量、周期上报指标
-6. ag-mem-01 总控漏斗F0：接收全局熔断/调度指令
-
-#### 被依赖模块（对外提供服务）
-1. ag-mem-24：写入结果回执
-2. ag-mem-27：提供全量待抽象经验数据集
-3. ag-mem-15~ag-mem-19 场景分槽：L4长期经验查询接口
-
-## 二、内部状态机（5种互斥运行状态）
-| 状态枚举常量 | 状态名称 | 业务含义 | 切换触发条件 |
+## 内部状态定义
+| 状态 | 标识 | 含义 | 触发条件 |
 |------|------|------|----------|
-| `NORMAL` | 正常服务 | 读写、查询、定时维护全部开放 | 初始化完成；熔断/抽象提炼结束恢复 |
-| `CAPACITY_WARNING` | 容量预警 | 使用率≥80%，提前触发遗忘温和清理 | 容量查询后计算水位80%≤使用率＜95% |
-| `CAPACITY_CRITICAL` | 容量紧急 | 使用率≥95%，阻断新增写入，强制低I条目遗忘 | 使用率≥95%，清理未达标持续保持 |
-| `ABSTRACTING` | 抽象提炼中 | 下发指令给ag-mem-27执行规则提取，写入请求排队 | 累计20条同槽新条目 / 72小时定时触发 |
-| `SYSTEM_PAUSED` | 暂停服务 | 全局熔断，所有读写、定时任务冻结 | 总控下发FUSE熔断指令；RESUME恢复指令退出 |
+| 待机就绪 | `L4_IDLE` | 正常接收ag-mem-25轻量化条目写入，等待定时晋升、归档扫描任务 | 系统初始化完成、熔断恢复、批次晋升/归档处理完毕 |
+| 轻量化条目持久写入 | `LIGHT_PERSIST` | 校验上游轻量化条目合法性，按funnel分域落盘，构建压缩向量索引，初始化完整元数据 | 收到ag-mem-25批量轻量化条目推送 |
+| 晋升筛选扫描 | `PROMOTE_SCAN` | 遍历分域存储条目，匹配分funnel晋升阈值、总复用、365天时效筛选可晋升条目 | 晋升定时周期倒计时归零 |
+| 归档遗忘扫描 | `ARCHIVE_SCAN` | 筛选低final_I、满365天时效条目，生成归档候选清单下发ag-mem-42 | 归档扫描周期到达 / ag-mem-48容量紧急预警触发加急扫描 |
+| 暂停服务 | `SYSTEM_PAUSED` | 全局熔断，停止写入、晋升扫描、归档扫描，内存缓存轻量化条目元数据 | F0下发FUSE熔断指令；RESUME指令切回L4_IDLE |
 
-## 三、全局存储配置常量
-| 配置项 | 默认值 | 业务说明 |
-|--------|:---:|------|
-| L4容量占漏斗二总比例 | 4.5% | 静态配额，由ag-mem-48统一核算管控 |
-| L4条目硬上限 | 1000条 | 条目计数器达上限直接触发紧急遗忘清理 |
-| 条目最大留存时长 | 无硬性时限 | 依靠遗忘策略动态淘汰，优质经验长期留存 |
-| 单条目数据上限 | 25KB | 超阈值直接丢弃，记录跳过日志 |
-| 单次写入超时阈值 | 300ms | 批量L3晋升写入最大阻塞时间 |
-| 容量预警水位 | 80% | 启动温和遗忘扫描释放空间 |
-| 容量紧急水位 | 95% | 阻断新写入，强制清理低重要度条目 |
-| 定量抽象提炼阈值 | 同槽新增20条 | 累计满20条自动触发分槽局部提炼 |
-| 定时抽象提炼周期 | 72h | 全局全量未提炼条目统一规则提取 |
-| 遗忘扫描周期 | 24h | 执行全量L4条目遗忘评估 |
-| 状态上报周期 | 120s | 向容量管控、调度单元推送指标 |
-| 遗忘保护等级 | 强保护 | L4遗忘阈值远宽松于L3，淘汰门槛更高 |
-
-## 四、输入总线接口（内部调度总线 只读）
-统一传输通道：内部调度总线，区分消息优先级
-| 输入消息名称 | 结构体类型 | 发送方模块 | 触发时机 | 优先级 |
+## 输入数据
+| 输入项 | 数据类型 | 来源模块 | 触发条件 | 优先级 |
 |--------|----------|----------|----------|:---:|
-| L4晋升条目列表 | List<L3PromoteNormalItem> | ag-mem-24 | L3条目满30天且无警示标签判定晋升L4 | 高 |
-| L4经验查询请求 | L4QueryReqStruct | ag-mem-15~19 | 场景分槽检索长期通用经验辅助决策 | 高 |
-| 抽象提炼完成回执 | AbstractCallbackStruct | ag-mem-27 | 规则提取任务执行完毕返回结果 | 高 |
-| 遗忘扫描完成回执 | ForgetCallbackStruct | ag-mem-40 | 批量遗忘清理完成返回空间释放数据 | 高 |
-| L4容量查询回执 | CapacityRespStruct | ag-mem-48 | 每次写入前主动查询容量后的返回数据 | 高 |
-| 全局调度控制指令 | Enum<F0Command> | ag-mem-01 | 系统暂停/恢复/熔断/手动维护扫描 | 紧急 |
+| L3轻量化完成条目批量推送 | List<Struct>（light_id轻量化ID、source_merge_ids源聚合ID集合、funnel分槽ID、final_I加权重要度、sum_reuse总复用、avg_S综合安全值、light_vector压缩向量、task_tag任务大类、create_ts创建时间戳） | ag-mem-25 L3轻量化归并单元 | ag-mem-25完成轻量化合并过滤，推送标准化长效条目 | 高 |
+| L4定时晋升扫描指令 | Struct（触发类型=定时，目标下游ag-mem-27） | 内部定时调度 | 晋升扫描周期倒计时归零 | 普通 |
+| L4归档遗忘扫描触发指令 | Struct（触发原因：定时/容量预警，是否加急） | 内部定时调度 / ag-mem-48容量管控单元 | 归档周期到达、分层容量触发紧急溢出阈值 | 普通 |
+| 轻量化条目元数据批量查询请求 | Struct（light_id轻量化ID列表） | ag-mem-37 / ag-mem-40 | 全局I值批量重算、全分层遗忘扫描 | 高 |
+| L4分层容量配额配置回执 | Struct（L4总容量上限、预警占用比例、紧急溢出比例、向量索引预留容量） | ag-mem-48 全局容量配额单元 | 模块初始化、人工调整分层配额 | 普通 |
+| 全局调度指令 | Enum（PAUSE/RESUME/FUSE） | ag-mem-01 总控F0 | 系统故障、紧急熔断停机、模式切换 | 紧急 |
 
-### 入参核心结构体定义
-1. **L3PromoteNormalItem L3晋升至L4条目**
-```json
-{
-  "item_id": "string 条目唯一ID",
-  "exp_raw_data": "原始经验结构化数据",
-  "I0": "float 原始基础重要度",
-  "S": "float 安全显著性",
-  "C": "float 复用频次",
-  "V": "float 用户价值（L4重算剔除该维度）",
-  "slot_id": "string 来源分槽编号",
-  "promote_ts": "long L3晋升时间戳",
-  "caution_tag": "enum[NONE/NORMAL/CAUTION]"
-}
-```
-2. **L4QueryReqStruct 查询请求**
-```json
-{
-  "query_filter": "多维度检索条件",
-  "slot_id": "来源分槽编号",
-  "max_return": "int 最大返回条目数量"
-}
-```
-3. **F0Command 调度指令枚举**
-`PAUSE / RESUME / FUSE / MAINT_SCAN`
-
-## 五、输出总线接口（内部调度总线 专属写入）
-| 输出消息名称 | 结构体类型 | 接收方模块 | 发送触发时机 | 优先级 |
+## 输出数据
+| 输出项 | 数据类型 | 目标模块 | 输出条件 | 优先级 |
 |--------|----------|----------|----------|:---:|
-| L4写入确认回执 | L4WriteAckStruct | ag-mem-24 | L3批量晋升条目写入处理完成 | 高 |
-| L4查询结果列表 | L4QueryRespStruct | 发起查询的ag-mem15~19 | 检索匹配条目完成 | 高 |
-| 抽象提炼触发指令 | AbstractTriggerCmd | ag-mem-27 | 定量20条达标 / 72h定时触发 | 高 |
-| 遗忘扫描触发指令 | ForgetTriggerCmd | ag-mem-40 | 容量紧急 / 24h定时扫描 | 高 |
-| L4周期状态上报 | L4StatusReportStruct | ag-mem-48、ag-mem-03 | 每120s / 内部状态瞬间变更 | 普通 |
+| L4轻量化条目写入完成回执 | Struct（批量总条数、成功写入数量、失败light_id清单） | ag-mem-25 L3轻量化归并单元 | 轻量化条目批量持久落盘、向量索引构建完成 | 高 |
+| 可晋升轻量化条目批量推送 | List<完整轻量化元数据、final_I、sum_reuse、funnel分槽、压缩向量> | ag-mem-27 L4抽象提炼单元 | 晋升筛选存在达标长效条目 | 高 |
+| L4归档遗忘候选清单 | List<Struct>（light_id、遗忘原因、当前final_I、分层归档阈值、suggest_handle=archive） | ag-mem-42 冗余记忆删除单元 | 归档扫描筛选出待清理长效条目 | 普通 |
+| L4轻量化条目元数据快照 | List<light_id、final_I、sum_reuse、create_ts、funnel_id、light_vector、task_tag> | ag-mem-37 / ag-mem-40 | I值刷新、遗忘扫描批量查询 | 高 |
+| L4分层容量占用上报 | Struct（层级=L4、业务数据占用KB、压缩向量索引占用KB、轻量化条目总数量） | ag-mem-48 全局容量配额 | 每60秒定时上报、批量条目变更后即时上报 | 普通 |
+| L4长效记忆变更审计日志 | Struct（事件类型、条目操作数量、funnel分槽范围、时间戳、溯源source_merge_ids） | ag-mem-51 记忆变更日志追溯单元 | 写入、晋升、归档清理操作完成 | 普通 |
+| L4周期运行统计上报 | Struct（当前状态、今日新增轻量化条目、累计晋升至ag-mem-27总量、累计归档清理总量、向量索引条目总数） | ag-mem-03 漏斗二专属调度单元 | 每180秒周期性上报 | 普通 |
 
-### 出参核心结构体定义
-1. **L4WriteAckStruct 写入回执**
-```json
-{
-  "total_receive": "int 接收条目总数",
-  "success_write": "int 成功入库条数",
-  "desensitize_count": "int 本次脱敏去个性化条目总数",
-  "current_usage": "float 当前存储使用率",
-  "msg": "异常描述，正常为空"
-}
+## L4长期层核心规则（严格对齐V1.1白皮书4.4.1五层晋升通路）
+### 1. 分funnel独立配置参数（由ag-mem-35统一分发）
+1. L4最大留存时效：365天，写入满365天未晋升自动进入归档流程；
+2. L4晋升至L5前置提炼最低final_I阈值：分业务funnel独立配置；
+3. L4归档遗忘final_I阈值：分业务funnel独立配置；
+4. 晋升最低累计总复用次数：100次；
+5. 准入前置校验：上游ag-mem-25输出合法light_id轻量化条目，无合法ID直接拒绝写入。
+
+### 2. 晋升至ag-mem-27完整准入条件（全部同时满足）
+1. 条目携带唯一合法light_id轻量化标识，来源为ag-mem-25标准化轻量化输出；
+2. 当前加权final_I ≥ 当前funnel分槽L4晋升阈值；
+3. 累计总复用次数 ≥ 100次；
+4. 轻量化条目写入未满365天，未达到最大留存时效；
+5. 无人工收藏/锁定保护标记。
+
+### 3. 归档清理触发条件（满足任意一条即加入归档候选）
+1. 加权final_I ＜ 当前funnel分槽L4归档遗忘阈值；
+2. 轻量化条目写入满365天仍未完成晋升至ag-mem-27；
+3. L4分层容量达到紧急溢出阈值，条目final_I处于全库后20%区间，强制加急归档释放空间。
+
+### 4. V1.1分层流转强制约束
+1. 唯一上游写入源：仅接收ag-mem-25推送轻量化条目，禁止任何其他模块直接写入，杜绝旁路篡改长效记忆；
+2. 单向流转链路：L4条目仅可晋升至ag-mem-27抽象提炼单元，不可跨层直达L5核心存储；
+3. 长效记忆清理规范：L2/L3/L4中长期记忆过期统一离线归档，不物理删除原始轻量化数据，完整保留溯源链路满足全链路审计；
+4. L5永久隔离：不存在任何L4条目直接流入顶层永久记忆的流转通道，必须经过ag-mem-27抽象提炼、ag-mem-45安全校验、ag-mem-29锁控三层前置流程。
+
+### 5. 批量处理约束
+单次晋升/归档扫描最大处理1000条轻量化条目，超量自动拆分多批次串行执行，避免大容量向量索引重建、磁盘IO阻塞。
+
+## 核心处理逻辑
 ```
-2. **L4QueryRespStruct 查询返回**
-```json
-{
-  "layer_tag": "L4",
-  "match_list": [
-    {
-      "item_id": "条目ID",
-      "exp_data": "脱敏后经验数据",
-      "I_l4": "L4重算后重要度",
-      "has_abstract": "bool 是否完成抽象提炼",
-      "last_access_ts": "long 最近访问时间"
-    }
-  ]
-}
-```
-3. **L4StatusReportStruct 状态上报**
-```json
-{
-  "internal_state": "状态枚举",
-  "total_item_count": "int 当前总条目数",
-  "usage_rate": "float 存储使用率",
-  "abstracted_item_total": "int 已完成抽象提炼条目总量",
-  "write_90d_sum": "int 近90日累计写入条目数"
-}
-```
+FUNCTION l4_longterm_storage_main_loop():
+    STATE_IDLE = L4_IDLE
+    STATE_PERSIST = LIGHT_PERSIST
+    STATE_PROMOTE = PROMOTE_SCAN
+    STATE_ARCHIVE = ARCHIVE_SCAN
+    STATE_PAUSED = SYSTEM_PAUSED
 
-## 六、去个性化脱敏规范（强制安全流程）
-### 6.1 脱敏目标
-L4经验用于跨用户、跨场景通用技能泛化，入库前必须清除所有可定位单一用户的隐私字段，杜绝用户数据泄露。
+    internal_state = STATE_IDLE
+    // 加载全局L4基础配置
+    l4_global_cfg = query_layer_config(from_m35="ag-mem-35")
+    l4_max_keep_ms = l4_global_cfg.L4_max_keep_day * 24 * 3600 * 1000
+    l4_promote_min_reuse = 100
+    // 按funnel业务域分域存储轻量化条目缓存
+    funnel_light_store = {}
+    stat_today_add = 0
+    stat_total_promote_abstract = 0
+    stat_total_archive = 0
+    last_report_ts = NOW()
+    // 定时周期配置
+    promote_cycle = l4_global_cfg.promote_scan_sec
+    archive_cycle = l4_global_cfg.archive_scan_sec
+    promote_countdown = promote_cycle
+    archive_countdown = archive_cycle
 
-### 6.2 字段处理规则表
-| 原始字段 | 处理策略 |
-|--------|----------|
-| 用户ID | 删除，替换固定标记「匿名用户」 |
-| 会话ID | 直接清空删除 |
-| 设备指纹 | 直接清空删除 |
-| 地理位置信息 | 直接清空删除 |
-| 用户原始输入文本 | 删除，仅保留标准化任务特征向量与意图标签 |
-| 用户个性化偏好参数 | 删除，仅保留通用工具调用序列 |
-| 写入时间戳 | 完整保留，用于时序趋势分析 |
-| 任务特征向量 | 完整保留（泛化核心依据） |
-| 工具调用序列 | 完整保留 |
-| 结果标签 | 完整保留 |
-| 基础I0、S、C值 | 保留，用于L4专属重要度重算 |
-| 来源分槽编号 | 完整保留 |
-
-### 6.3 L4专属重要度重算公式
-剔除用户价值V维度，仅基于安全、复用能力计算长期层重要度：
-$$
-I_{L4} = I_0 + \alpha \times S + \gamma \times C
-$$
-- $\alpha、\gamma$：各场景分槽独立配置权重系数
-- 不再引入用户价值V，消除个体偏好对通用经验的干扰
-
-## 七、完整业务主流程伪代码（注释优化版）
-```python
-FUNCTION l4_storage_main_loop():
-    # 状态常量定义
-    STATE_NORMAL = "NORMAL"
-    STATE_CAP_WARN = "CAPACITY_WARNING"
-    STATE_CAP_CRIT = "CAPACITY_CRITICAL"
-    STATE_ABSTRACT = "ABSTRACTING"
-    STATE_PAUSE = "SYSTEM_PAUSED"
-
-    internal_state = STATE_NORMAL
-    init_l4_storage()  # 内存索引+持久化分区初始化
-    item_counter = 0  # L4总条目计数器
-    slot_new_item_stat = {}  # slot_id: 分槽自上次提炼新增条目数
-
-    WHILE system_running:
-        # 1. 最高优先级：全局熔断调度指令
-        if recv_global_f0_cmd():
-            cmd = get_f0_cmd()
-            if cmd == "FUSE":
+    WHILE 系统运行中:
+        // 1. 全局熔断最高优先级处理
+        IF 收到全局调度指令:
+            cmd = 获取调度指令
+            IF cmd == "FUSE":
                 internal_state = STATE_PAUSED
-                continue
-            if cmd == "RESUME" and internal_state == STATE_PAUSED:
-                internal_state = STATE_NORMAL
+                CONTINUE
+            IF cmd == "RESUME" AND internal_state == SYSTEM_PAUSED:
+                internal_state = STATE_IDLE
 
-        # 2. 接收L3晋升条目写入消息
-        if recv_l3_promote_list():
-            if internal_state == STATE_PAUSED:
-                send_write_ack(total=len(list), success=0, desensitize=0, msg="系统熔断")
-                continue
-            
-            raw_promote_list = get_promote_list()
-            # 准入校验：过滤所有CAUTION警示条目
-            valid_list = []
-            error_msg = ""
-            for item in raw_promote_list:
-                if item.caution_tag == "CAUTION":
-                    error_msg += f"拒绝CAUTION条目:{item.item_id};"
-                    continue
-                valid_list.append(item)
-            if len(valid_list) == 0:
-                log("全部条目为警示条目，拒绝写入", error_msg)
-                continue
-
-            # 查询实时容量水位
-            cap_resp = call_ag_mem48_query_cap()
-            usage = cap_resp.usage_rate
-            # 更新内部容量状态
-            if usage >= 0.95:
-                internal_state = STATE_CAP_CRIT
-            elif usage >= 0.8:
-                internal_state = STATE_CAP_WARN
-
-            # 容量紧急：强制遗忘低I条目清理
-            if internal_state == STATE_CAP_CRIT:
-                send_forget_scan_cmd(range="low_15pct_I", reason="容量紧急")
-                wait_forget_callback()
-                new_cap = call_ag_mem48_query_cap()
-                if new_cap.usage_rate >= 0.95:
-                    send_write_ack(len(raw_promote_list),0,0,"L4容量已满，拒绝写入")
-                    continue
-
-            # 逐条脱敏、重算I值、入库
+        // 2. 接收上游ag-mem-25批量轻量化条目写入（唯一上游来源）
+        IF 收到L3轻量化完成条目批量推送:
+            batch_write_req = 获取轻量化条目列表
+            internal_state = LIGHT_PERSIST
             success_cnt = 0
-            desensitize_cnt = 0
-            for item in valid_list:
-                # 单条目大小超限丢弃
-                if get_exp_size(item.exp_raw_data) > 25:
-                    log_skip(item.item_id, "超过25KB单条目上限")
-                    continue
-                # 执行去个性化脱敏
-                desensitize_exp = desensitize_process(item.exp_raw_data)
-                desensitize_cnt += 1
-                # L4重要度重算
-                l4_I = item.I0 + alpha * item.S + gamma * item.C
-                # 持久化写入L4
-                write_ok = storage_append(
-                    item_id=item.item_id,
-                    exp_data=desensitize_exp,
-                    I_l4=l4_I,
-                    slot_id=item.slot_id,
-                    caution_tag="NORMAL",
-                    write_ts=NOW()
+            fail_light_ids = []
+            now_ts = NOW()
+            FOR light_item IN batch_write_req:
+                light_id = light_item.light_id轻量化ID
+                funnel_id = light_item.funnel分槽ID
+                // 前置合法性校验
+                IF light_id == None OR light_item.final_I <= 0 OR light_item.sum_reuse < 2:
+                    fail_light_ids.append(light_id)
+                    CONTINUE
+                // 按funnel分域初始化存储，构建压缩向量索引
+                IF funnel_id NOT IN funnel_light_store:
+                    funnel_light_store[funnel_id] = {}
+                funnel_light_store[funnel_id][light_id] = {
+                    "light_id": light_id,
+                    "source_merge_ids": light_item.source_merge_ids,
+                    "funnel_id": funnel_id,
+                    "final_I": light_item.final_I加权重要度,
+                    "sum_reuse": light_item.sum_reuse总复用,
+                    "avg_S": light_item.avg_S综合安全值,
+                    "create_ts": light_item.create_ts创建时间戳,
+                    "last_access_ts": now_ts,
+                    "manual_tag": "无",
+                    "light_vector": light_item.light_vector压缩向量,
+                    "task_tag": light_item.task_tag任务大类
+                }
+                success_cnt += 1
+                stat_today_add += 1
+            // 回执回写给上游ag-mem-25
+            write_ack = build_l4_write_ack(total=len(batch_write_req), success=success_cnt, fail_list=fail_light_ids)
+            send_write_ack(target="ag-mem-25", ack_data=write_ack)
+            // 写入审计日志
+            send_audit_log(event="L4批量接收ag-mem-25轻量化长效条目", add_count=success_cnt, ts=now_ts)
+            internal_state = STATE_IDLE
+
+        // 3. 定时晋升筛选扫描，批量推送达标条目至ag-mem-27
+        IF internal_state == STATE_IDLE:
+            promote_countdown -= 10
+            IF promote_countdown <= 0:
+                internal_state = PROMOTE_SCAN
+                promote_list = []
+                now_ts = NOW()
+                // 遍历所有funnel业务域
+                FOR funnel_id, light_map IN funnel_light_store.items():
+                    slot_cfg = get_slot_config(funnel_id, global_cfg=l4_global_cfg)
+                    FOR light_id, light_data IN light_map.items():
+                        age = now_ts - light_data.create_ts
+                        // 跳过超期、人工保护轻量化条目
+                        IF age >= l4_max_keep_ms OR light_data.manual_tag != "无":
+                            CONTINUE
+                        // 校验全部晋升准入条件
+                        IF light_data.final_I >= slot_cfg.L4_promote_thresh AND light_data.sum_reuse >= l4_promote_min_reuse:
+                            promote_list.append(light_data)
+                // 批量推送晋升条目至ag-mem-27
+                IF len(promote_list) > 0:
+                    send_promote_batch(target="ag-mem-27", item_list=promote_list)
+                    stat_total_promote_abstract += len(promote_list)
+                    // 从L4分域存储移除已晋升轻量化条目
+                    FOR promote_item IN promote_list:
+                        del funnel_light_store[promote_item.funnel_id][promote_item.light_id]
+                    send_audit_log(event="L4批量晋升轻量化条目至ag-mem-27抽象提炼单元", count=len(promote_list), ts=now_ts)
+                promote_countdown = promote_cycle
+                internal_state = STATE_IDLE
+
+        // 4. 定时归档遗忘扫描，生成归档候选推送ag-mem-42
+        IF internal_state == STATE_IDLE:
+            archive_countdown -= 10
+            IF archive_countdown <= 0:
+                internal_state = ARCHIVE_SCAN
+                archive_candidate = []
+                now_ts = NOW()
+                FOR funnel_id, light_map IN funnel_light_store.items():
+                    slot_cfg = get_slot_config(funnel_id, global_cfg=l4_global_cfg)
+                    FOR light_id, light_data IN light_map.items():
+                        age = now_ts - light_data.create_ts
+                        // 人工收藏/锁定条目直接跳过归档
+                        IF light_data.manual_tag in ["用户收藏", "人工锁定"]:
+                            CONTINUE
+                        need_archive = False
+                        reason = ""
+                        if light_data.final_I < slot_cfg.L4_archive_thresh:
+                            need_archive = True
+                            reason = "轻量化final_I低于当前funnel L4归档遗忘阈值"
+                        elif age >= l4_max_keep_ms:
+                            need_archive = True
+                            reason = "轻量化长效条目留存满365天未晋升至抽象提炼层"
+                        if need_archive:
+                            archive_candidate.append({
+                                "light_id": light_id,
+                                "forget_reason": reason,
+                                "item_I": light_data.final_I,
+                                "layer_threshold": slot_cfg.L4_archive_thresh,
+                                "suggest_handle": "archive",
+                                "layer": "L4",
+                                "slot_id": funnel_id
+                            })
+                // 推送归档候选清单至ag-mem-42
+                IF len(archive_candidate) > 0:
+                    send_archive_list(target="ag-mem-42", candidate=archive_candidate)
+                    stat_total_archive += len(archive_candidate)
+                archive_countdown = archive_cycle
+                internal_state = STATE_IDLE
+
+        // 5. 响应ag-mem-37 / ag-mem-40 轻量化条目元数据批量查询
+        IF 收到轻量化条目元数据批量查询请求:
+            query_light_ids = 获取请求light_id轻量化ID列表
+            meta_result = []
+            FOR funnel_id, light_map IN funnel_light_store.items():
+                FOR light_id IN query_light_ids:
+                    IF light_id IN light_map:
+                        meta_result.append(light_map[light_id])
+            send_meta_snapshot(target="ag-mem-37", meta_list=meta_result)
+            send_meta_snapshot(target="ag-mem-40", meta_list=meta_result)
+
+        // 6. 定时容量上报 + 180s周期运行统计上报
+        IF NOW() - last_report_ts >= 60 * 1000:
+            data_kb, vec_index_kb = calc_layer_cap_kb(funnel_light_store, avg_kb=l4_global_cfg.avg_light_kb, vec_overhead=l4_global_cfg.compressed_vec_overhead_kb)
+            total_light_count = sum(len(v) for v in funnel_light_store.values())
+            cap_report = build_cap_report(layer="L4", data_used_kb=data_kb, vec_index_kb=vec_index_kb, item_count=total_light_count)
+            send_cap_report(target="ag-mem-48", report=cap_report)
+            // 每180s向ag-mem-03上报运行统计
+            IF NOW() - last_report_ts >= 180 * 1000:
+                stat_report = build_l4_stat_report(
+                    state=internal_state,
+                    today_add=stat_today_add,
+                    total_promote=stat_total_promote_abstract,
+                    total_archive=stat_total_archive
                 )
-                if write_ok:
-                    success_cnt += 1
-                    item_counter += 1
-                    # 更新分槽新增条目计数
-                    slot = item.slot_id
-                    slot_new_item_stat[slot] = slot_new_item_stat.get(slot, 0) + 1
+                send_stat_report(target="ag-mem-03", report=stat_report)
+            last_report_ts = NOW()
 
-            # 返回写入回执给ag-mem-24
-            send_write_ack(
-                total_receive=len(raw_promote_list),
-                success_write=success_cnt,
-                desensitize_count=desensitize_cnt,
-                current_usage=usage
-            )
-
-            # 定量触发抽象提炼：单槽累计≥20条
-            for slot, cnt in slot_new_item_stat.items():
-                if cnt >= 20:
-                    send_abstract_trigger(
-                        range=f"slot_{slot}_new_20",
-                        source_slot="ag-mem-26",
-                        group=get_slot_recent_20_items(slot)
-                    )
-                    slot_new_item_stat[slot] = 0
-
-        # 3. 处理场景分槽查询请求
-        if recv_l4_query_req():
-            req = get_query_req()
-            raw_match = storage_search(req.query_filter, req.slot_id, req.max_return)
-            # 标记条目是否已抽象提炼
-            for entry in raw_match:
-                entry.has_abstract = storage_is_abstracted(entry.item_id)
-            send_query_resp(req.slot_id, raw_match)
-
-        # 4. 72小时定时全局抽象提炼
-        if NOW() - last_abstract_timer >= 72*3600:
-            internal_state = STATE_ABSTRACT
-            all_slots = storage_get_all_slot_ids()
-            for slot in all_slots:
-                unabstract_items = storage_filter(slot=slot, abstracted=False)
-                if len(unabstract_items) >= 5:
-                    send_abstract_trigger(
-                        range=f"slot_{slot}_all_unabstract",
-                        source_slot="ag-mem-26",
-                        group=unabstract_items
-                    )
-            internal_state = STATE_NORMAL
-            last_abstract_timer = NOW()
-
-        # 5. 24小时定时遗忘扫描（强保护阈值下发）
-        if NOW() - last_forget_timer >= 24*3600 and internal_state in [STATE_NORMAL, STATE_CAP_WARN]:
-            send_forget_scan_cmd(
-                range="full_l4",
-                threshold=get_l4_slot_forget_threshold(),
-                protect_level="strong",
-                source="ag-mem-26"
-            )
-            last_forget_timer = NOW()
-
-        # 6. 接收抽象提炼完成回执，更新条目抽象标记
-        if recv_abstract_callback():
-            callback = get_abstract_callback()
-            for rule in callback.rule_list:
-                source_ids = rule.source_item_ids
-                for item_id in source_ids:
-                    storage_update_abstract_flag(item_id, abstracted=True, rule_id=rule.rule_id)
-
-        # 7. 120秒周期状态指标上报
-        if NOW() - last_report_timer >= 120:
-            abstract_total = storage_count_abstracted_items()
-            report = build_status_report(
-                internal_state, item_counter, usage, abstract_total
-            )
-            send_status_report(report, target=["ag-mem-48", "ag-mem-03"])
-            last_report_timer = NOW()
-
-        SLEEP(10)
-
-# 去个性化脱敏子函数
-FUNCTION desensitize_process(raw_exp_data):
-    exp = deep_clone(raw_exp_data)
-    exp.user_id = "匿名用户"
-    exp.session_id = None
-    exp.device_finger = None
-    exp.location = None
-    exp.user_raw_input = None
-    exp.user_pref_params = None
-    # 保留字段不做修改：特征向量、工具序列、标签、时间戳、分槽ID
-    return exp
+        SLEEP 10ms
 ```
 
-## 八、异常故障处理矩阵
-| 故障场景 | 处理逻辑 | 恢复条件 |
+## 约束与异常处理
+| 场景 | 处理方式 | 恢复条件 |
 |------|----------|----------|
-| 晋升条目携带CAUTION警示标签 | 整条过滤拒绝写入，回执附带错误日志 | 条目在L3完成警示降级为NORMAL后重新发起晋升 |
-| L4底层存储IO读写异常 | 停止当前批次写入，返回实际成功条数，上报告警 | 存储介质/服务IO恢复正常 |
-| 单条目超过25KB存储上限 | 跳过本条，记录丢弃日志，不阻塞整批写入 | 无，本条永久丢弃 |
-| 使用率95%，遗忘清理后水位仍超标 | 阻断全部新增L3晋升写入，持续告警 | 人工扩容/大量条目满足遗忘条件被清理 |
-| 脱敏去个性化出现数据格式兼容异常 | 执行极简保守脱敏，清空全部隐私字段，标记异常日志 | 上游L3输出数据格式修复统一 |
-| 抽象提炼执行中收到批量写入 | 写入消息进入总线排队队列，提炼完成后批量处理 | ag-mem-27返回提炼完成回执，退出ABSTRACTING状态 |
-| 全局紧急熔断指令下发 | 冻结所有读写、定时任务，持久化数据不做任何修改 | 总控下发RESUME恢复指令 |
+| ag-mem-25推送轻量化条目light_id缺失、final_I非法 | 写入失败，加入失败列表回传给上游，不存入L4分域存储 | ag-mem-25重新推送标准化完整轻量化条目 |
+| 晋升扫描时轻量化条目同步触发归档判定 | 条目归入归档候选，不再参与晋升，快照隔离并发变更无报错 | 无需人工干预，下一轮扫描正常执行 |
+| 单次扫描轻量化条目总量超过1000条 | 自动拆分多批次串行处理，不阻塞主定时循环与压缩向量索引 | 内置分片逻辑自动执行 |
+| L4持久存储/压缩向量索引IO读写故障 | 内存funnel分域缓存完整保留轻量化元数据，下一轮定时重试晋升/归档扫描 | 底层存储、向量库IO链路恢复 |
+| 全局紧急熔断FUSE指令下发 | 停止写入、晋升扫描、归档扫描，内存缓存轻量化条目不丢失 | ag-mem-01下发RESUME恢复指令，自动重启定时任务 |
+| 目标funnel分槽无专属L4阈值配置 | 自动加载全局通用L4阈值兜底完成判定 | ag-mem-35运维侧补充分funnel独立参数 |
 
-## 九、内部调度总线访问契约
-| 总线方向 | 消息类型 | 访问权限 | 通信双方 |
-|------|----------|------|------|
-| 读（入站） | L4晋升条目列表 | 只读 | ag-mem-24 → ag-mem-26 |
-| 读（入站） | L4经验查询请求 | 只读 | ag-mem15~19 → ag-mem-26 |
-| 读（入站） | 抽象/遗忘/容量回执、全局调度指令 | 只读 | 各模块/总控 → ag-mem-26 |
-| 写（出站） | L4写入确认回执 | 模块专属写入 | ag-mem-26 → ag-mem-24 |
-| 写（出站） | L4查询结果列表 | 模块专属写入 | ag-mem-26 → 对应场景分槽 |
-| 写（出站） | 抽象提炼/遗忘扫描触发指令 | 模块专属写入 | ag-mem-26 → ag-mem27 / ag-mem40 |
-| 写（出站） | 周期状态指标上报 | 周期性写入 | ag-mem-26 → ag-mem48、ag-mem03 |
+## 总线契约
+| 总线 | 操作 | 数据内容 | 权限 | 说明 |
+|------|------|----------|------|------|
+| 内部调度总线 | 读 | L3轻量化完成条目批量推送 | 只读 | ag-mem-25（唯一上游写入源） |
+| 内部调度总线 | 读 | 轻量化条目元数据批量查询请求 | 只读 | ag-mem-37、ag-mem-40 |
+| 内部调度总线 | 读 | 全局调度熔断指令 | 只读 | ag-mem-01 |
+| 内部调度总线 | 写 | L4轻量化条目写入完成回执 | 专属写入 | 回传给上游 ag-mem-25 |
+| 内部调度总线 | 写 | 晋升轻量化条目批量推送 | 专属写入 | 下发下游 ag-mem-27 |
+| 内部调度总线 | 写 | 归档候选清单、轻量化条目元数据快照 | 专属写入 | ag-mem-42、ag-mem-37、ag-mem-40 |
+| 内部调度总线 | 写 | 容量上报、审计日志、周期统计上报 | 周期/事件写入 | ag-mem-48、ag-mem-51、ag-mem-03 |
 
-## 十、强制安全边界（不可绕过）
-| 编号 | 约束规则 |
+## 安全边界（V1.1强制规范）
+| 规则编号 | 内容 |
 |:---:|------|
-| S-01 | 所有入库L4经验必须完整执行去个性化脱敏，严禁留存任何可定位单一用户的隐私信息 |
-| S-02 | L4长期层永久拒绝CAUTION警示条目，失败/策略失误经验无法晋升至长期存储 |
-| S-03 | L4条目启用强遗忘保护机制，淘汰阈值远宽松于L3，仅极低I值且复用不足才允许遗忘评估 |
-| S-04 | L4重要度重算必须剔除用户价值V维度，仅依靠安全显著性S、复用频次C计算通用经验权重 |
-| S-05 | 从L4晋升至L5核心层的经验，必须额外经过ag-mem-43独立安全底线校验，本模块不省略该流程 |
+| L4-01 | L4仅接收ag-mem-25轻量化输出条目，禁止ag-mem-03或其他模块直接写入，杜绝旁路篡改长效记忆数据 |
+| L4-02 | L4轻量化条目仅单向晋升至ag-mem-27抽象提炼单元，禁止任何跨层直达L5顶层记忆的流转路径，分层链路单向隔离不可绕过 |
+| L4-03 | L4过期低价值轻量化条目统一执行离线归档，不物理删除原始长效数据，完整保留多层溯源ID集合，满足V1.1全链路审计追溯要求 |
+| L4-04 | 晋升阈值、归档阈值、365天留存时效统一由ag-mem-35集中管控，本模块无本地硬编码业务参数 |
+| L4-05 | L4分层业务数据+压缩向量索引容量上限、预警/紧急阈值由ag-mem-48统一管控，容量紧急自动加急归档释放存储空间 |
+| L4-06 | 熔断状态内存funnel分域缓存完整保留所有轻量化条目元数据，服务恢复后自动执行定时晋升与归档扫描，无数据丢失 |
 
-## 十一、自动化功能测试用例全覆盖
-| 用例编号 | 前置条件 | 输入消息 | 预期输出结果 |
+## 接口校验用例
+| 用例编号 | 前置条件 | 输入 | 预期输出 |
 |----------|----------|------|----------|
-| TC-M26-01 | NORMAL，使用率50%，3条无警示晋升条目 | L3晋升条目列表 | 全部脱敏写入成功，I值剔除V重算，回执脱敏计数正常 |
-| TC-M26-02 | NORMAL，单条CAUTION警示晋升条目 | 含警示标签的晋升条目 | 直接过滤拒绝写入，回执附带错误描述 |
-| TC-M26-03 | NORMAL，场景分槽查询请求 | 指定槽位检索指令 | 返回匹配条目，每条携带has_abstract提炼标记 |
-| TC-M26-04 | NORMAL，同槽累计写入至第20条有效条目 | 第20条同分槽晋升条目入库 | 自动下发抽象提炼指令至ag-mem-27，计数清零 |
-| TC-M26-05 | NORMAL，距离上次提炼满72小时 | 定时触发检测逻辑 | 遍历所有分槽未提炼条目，批量下发提炼指令 |
-| TC-M26-06 | CAPACITY_CRITICAL，遗忘清理后使用率仍96% | 批量晋升写入请求 | 执行遗忘清理后依旧容量超限，拒绝所有写入，告警上报 |
+| TC-M26-01 | `L4_IDLE`，ag-mem-25推送带合法light_id、final_I合规轻量化条目 | L3轻量化条目批量列表 | 条目按funnel分域持久存入L4，构建压缩向量索引，返回写入成功回执，生成新增审计日志 |
+| TC-M26-02 | `L4_IDLE`，条目final_I达标、总复用≥100、未满365天，定时晋升触发 | 晋升倒计时归零 | 轻量化条目批量推送至ag-mem-27，从L4对应funnel分域移除 |
+| TC-M26-03 | `L4_IDLE`，轻量化条目final_I低于当前funnel L4归档阈值 | 归档扫描触发 | 条目加入归档候选清单推送ag-mem-42，标记处理方式archive |
+| TC-M26-04 | `L4_IDLE`，轻量化条目写入满365天未满足晋升条件 | 归档扫描触发 | 因超期标记归档，进入清理候选清单 |
+| TC-M26-05 | `L4_IDLE`，ag-mem-37下发light_id批量元数据查询 | 轻量化ID批量查询请求 | 返回对应funnel域内完整轻量化元数据+压缩向量快照 |
+| TC-M26-06 | `L4_IDLE`，接收全局FUSE熔断指令 | 紧急调度熔断指令 | 切换SYSTEM_PAUSED，停止写入、晋升、归档扫描全部任务 |
 
-## 十二、交付验收自检清单
-| 检查项 | 完成状态 |
+## 质量自检清单
+| 检查项 | 状态 |
 |--------|:---:|
-| 模块编号、漏斗二层五层存储层级定位准确 | ✅ |
-| 上下游依赖、被依赖模块完整无遗漏 | ✅ |
-| 5种内部状态+完整切换触发条件定义清晰 | ✅ |
-| 全部输入输出附带结构体、收发模块、优先级 | ✅ |
-| L4存储配置参数完整，包含定量/定时抽象阈值 | ✅ |
-| 去个性化脱敏字段规则、I值重算公式完整 | ✅ |
-| 伪代码覆盖警示过滤、脱敏、重算、定量/定时抽象、查询、遗忘扫描全链路 | ✅ |
-| 异常场景覆盖7类典型故障处理逻辑 | ✅ |
-| 内部调度总线读写权限划分清晰 | ✅ |
-| 5条强制安全约束无逻辑漏洞 | ✅ |
-| 6条测试用例覆盖全部核心业务分支 | ✅ |
+| 模块编号ag-mem-26匹配V1.1白皮书L4长效轻量化存储定位 | ✅ |
+| 上下游依赖唯一上游ag-mem-25、下游ag-mem-27，数据流闭环无冲突 | ✅ |
+| 5种内部状态、完整切换触发条件定义清晰 | ✅ |
+| 全部输入输出标注来源/目标模块、结构体、优先级，上下游链路无错乱 | ✅ |
+| 分域压缩向量存储、light_id准入校验、365天时效、晋升/归档规则完整贴合白皮书4.4.1五层晋升通路 | ✅ |
+| 伪代码覆盖轻量化条目写入、分域持久化、定时晋升扫描、归档扫描、元数据查询、容量上报、审计日志全链路 | ✅ |
+| 异常场景覆盖非法轻量化条目、并发归档、超大批次、向量IO故障、熔断、无分槽阈值共6类全覆盖 | ✅ |
+| 内部调度总线读写权限划分清晰，上游仅允许ag-mem-25写入 | ✅ |
+| 6条V1.1强制安全约束无旁路写入、跨层流转漏洞 | ✅ |
+| 6条自动化测试用例覆盖全部核心业务分支 | ✅ |
 
-## 模块联动补充说明（对接上层L3、下层L5）
-1. 仅接收ag-mem-24推送的**无CAUTION标签**、满30天生命周期的L3合格经验；失败警示经验永久阻断晋升L4；
-2. 本模块仅下发抽象提炼任务给ag-mem-27，不负责规则生成、存储，仅同步更新条目「已抽象」标记；
-3. L4无自主删除能力，所有条目淘汰、清理仅下发指令至ag-mem-40遗忘单元执行；
-4. 满足L5晋升门槛的经验由本模块主动推送至ag-mem-28，晋升前强制走独立安全校验单元ag-mem-43；
-5. 脱敏流程为入库前置强制步骤，不存在跳过脱敏写入的业务分支。
+---
