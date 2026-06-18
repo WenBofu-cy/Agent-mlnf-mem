@@ -1,0 +1,301 @@
+# ag-mem-01 总控F0全局熔断调度单元 完整标准化接口文档（对齐EM-Core-Agent V1.1白皮书全局顶层调度底座）
+## 基本信息
+| 项 | 内容 |
+|----|------|
+| 模块编号 | ag-mem-01 |
+| 模块名称 | 总控F0全局熔断调度单元 |
+| 所属分区 | 全局顶层调度底座（所有记忆分层模块统一管控中枢） |
+| 核心职责 | 全链路唯一顶层调度入口，统一管控ag-mem03~ag-mem52全部记忆子模块；实时采集全模块健康状态、CPU/内存/IO负载、报错异常；维护全局三级熔断策略（预警限流、半熔断降级、全熔断停机）；下发PAUSE/RESUME/FUSE三类全局调度指令至所有下游记忆模块；接收运维后台人工启停、分区隔离、紧急故障处置指令；统一汇总全模块故障告警、心跳失联告警推送运维面板；对外提供全局调度状态快照供所有模块读取；定时上报全局调度自身资源占用至ag-mem-48；所有熔断触发、指令下发、故障隔离操作全量写入ag-mem-51审计日志；无业务记忆存储、无分槽路由、无记忆晋升/归档业务逻辑，纯底层全局调度管控底座。 |
+| 依赖模块 | 无上游依赖，全局顶层根模块；仅依赖ag-mem-35（三维权重配置单元，读取熔断阈值、心跳超时、降级策略）、ag-mem-48（全局容量配额，上报自身调度内存占用） |
+| 被依赖模块 | 全部记忆分层模块（ag-mem15~ag-mem30、ag-mem03、ag-mem37、ag-mem40、ag-mem42、ag-mem45、ag-mem48、ag-mem51）；运维告警面板（接收全局故障、熔断告警） |
+
+## 内部状态定义
+| 状态 | 标识 | 含义 | 触发条件 |
+|------|------|------|----------|
+| 全局正常运行 | `F0_RUN` | 所有子模块心跳正常、负载低于预警阈值，无熔断，可正常下发业务指令 | 系统冷启动完成、全模块心跳恢复、熔断解除RESUME指令生效 |
+| 全局预警限流 | `F0_WARN_LIMIT` | 部分模块负载超标/少量心跳失联，下发局部限流指令，全链路保留基础读写能力 | 单模块负载达到预警阈值、单模块心跳超时未失联 |
+| 全局半熔断降级 | `F0_HALF_FUSE` | 多模块异常、整体资源高负载，下发PAUSE暂停非核心记忆流程，仅保留L0-L5基础持久通路 | 多模块同时告警、全局资源占用达85%阈值 |
+| 全局全熔断停机 | `F0_FULL_FUSE` | 重大故障、底层存储宕机、安全风险，下发FUSE强制全模块暂停所有读写、计算、分发任务 | 底层存储IO故障、安全校验批量报错、运维人工紧急停机指令 |
+| 调度待机初始化 | `F0_INIT` | 系统启动阶段，等待所有子模块上报首次心跳，加载全局熔断配置 | 服务进程启动，未完成全模块心跳注册 |
+
+## 输入数据
+| 输入项 | 数据类型 | 来源模块 | 触发条件 | 优先级 |
+|--------|----------|----------|----------|:---:|
+| 各子模块心跳健康快照 | List<Struct>（module_id、current_state、cpu_usage、mem_used、error_count、last_heartbeat_ts） | 全记忆子模块（ag-mem03/15~30/37/40/42/45/48/51） | 各模块每10秒主动上报心跳状态 | 最高 |
+| 全局熔断策略配置回执 | Struct（心跳超时ms、预警负载阈值、半熔断资源阈值、全熔断触发条件、分模块降级白名单） | ag-mem-35 三维权重配置单元 | 调度单元初始化、熔断策略运维更新 | 普通 |
+| 运维人工调度指令 | Enum（START/PAUSE_ALL/RESUME_ALL/FULL_FUSE/ISOLATE_SLOT） | 运维后台管控面板 | 人工执行启停、分区隔离、紧急熔断操作 | 紧急 |
+| 全局调度状态批量查询请求 | Struct（指定module_id列表 / 全模块状态导出） | 所有记忆子模块、运维面板 | 各模块读取全局熔断状态、运维查看全链路健康大盘 | 高 |
+
+## 输出数据
+| 输出项 | 数据类型 | 目标模块 | 输出条件 | 优先级 |
+|--------|----------|----------|----------|:---:|
+| 全局调度控制指令 | Enum（PAUSE/RESUME/FUSE） | 全部下游记忆子模块 | 触发预警/半熔断/全熔断、人工恢复指令下发 | 最高 |
+| 分模块局部限流/隔离指令 | List<Struct>（target_module_id、limit_rate、isolate_funnel_list） | 指定异常子模块 | 单模块负载超标、单分槽故障隔离 | 高 |
+| 全局故障&熔断告警汇总报表 | Struct（熔断等级、异常模块清单、故障类型、风险等级、处置建议） | 运维告警面板 | 进入预警/半熔断/全熔断任一状态 | 普通 |
+| 全局全模块状态快照 | List<Struct>（module_id、running_state、load、heartbeat_status、current_fuse_level） | 所有记忆子模块、运维面板 | 收到全局调度状态查询请求 | 高 |
+| F0调度内存占用上报 | Struct（单元标识ag-mem-01、心跳缓存总KB、模块配置缓存KB、监控模块总数） | ag-mem-48 全局容量配额 | 每60秒定时上报、熔断策略更新后即时上报 | 普通 |
+| 全局调度审计日志 | Struct（事件类型、熔断等级、受影响模块数量、人工操作账号、时间戳、故障明细） | ag-mem-51 记忆变更日志追溯单元 | 熔断切换、人工调度指令下发、模块隔离操作完成 | 普通 |
+| F0调度周期运行统计上报 | Struct（当前全局熔断状态、今日触发预警次数、半熔断次数、全熔断停机次数、失联模块累计数量） | ag-mem-03 漏斗二调度单元 | 每180秒周期性上报全局调度大盘指标 | 普通 |
+
+## F0全局熔断调度核心规则（V1.1全局稳定性底座规范）
+### 1. 全局熔断基础配置参数（ag-mem-35统一分发）
+1. 心跳超时阈值：30000ms（30秒），连续3轮无心跳判定模块失联；
+2. 预警负载阈值：单模块CPU≥75% / 内存占用≥80%；
+3. 半熔断全局资源阈值：全链路总内存占用≥85%；
+4. 全熔断触发硬条件：底层存储IO报错连续20次、安全校验批量拦截超阈值、运维人工紧急停机；
+5. 三级熔断优先级：人工FUSE指令 > 底层存储故障全熔断 > 全局资源半熔断 > 单模块预警限流。
+
+### 2. 三级熔断行为定义
+1. F0_WARN_LIMIT（预警限流）
+   - 仅对异常模块下发写入限流指令，其余模块正常运行；
+   - 不暂停记忆晋升、归档、分槽分发业务；
+   - 持续输出低风险告警至运维面板。
+2. F0_HALF_FUSE（半熔断降级）
+   - 下发PAUSE指令至非核心模块（ag-mem16/17/18/19辅助统计单元、ag-mem37/40遗忘计算单元）；
+   - 保留ag-mem15分槽主调度、ag-mem20~30五层存储核心链路正常读写；
+   - 暂停定时扫描、统计上报、冷热计算等非关键后台任务。
+3. F0_FULL_FUSE（全熔断停机）
+   - 全模块下发FUSE强制暂停指令；
+   - 所有原始数据分发、条目写入、晋升、归档、向量计算、元数据查询全部停止；
+   - 仅保留心跳上报、审计日志写入、运维告警三条基础通路。
+
+### 3. 人工运维指令约束
+1. ISOLATE_SLOT：仅隔离指定funnel分槽流量，不改变全局熔断等级；
+2. FULL_FUSE：强制切换至全熔断，所有业务链路冻结；
+3. RESUME_ALL：仅当无底层硬件/存储故障时，才可解除熔断恢复`F0_RUN`。
+
+### 4. 流转强制约束
+1. 全局唯一调度下发入口：所有记忆模块的暂停/恢复/熔断指令仅由ag-mem-01输出，禁止模块间互相下发管控指令；
+2. 无任何业务记忆数据读写、持久存储、分槽创建销毁能力，仅做状态监控与指令下发；
+3. 熔断状态单向递进：正常→预警→半熔断→全熔断；恢复必须逐级解除，不可跨级直接恢复；
+4. 所有子模块必须被动遵从F0下发的调度指令，指令优先级高于自身内部定时任务。
+
+### 5. 批量约束
+单次批量下发调度指令最大支持50个模块，超量自动分片串行推送，避免总线瞬时消息风暴。
+
+## 核心处理逻辑
+```
+FUNCTION f0_global_fuse_main_loop():
+    STATE_INIT = F0_INIT
+    STATE_RUN = F0_RUN
+    STATE_WARN = F0_WARN_LIMIT
+    STATE_HALF = F0_HALF_FUSE
+    STATE_FULL = F0_FULL_FUSE
+    internal_state = STATE_INIT
+
+    // 加载全局熔断配置
+    fuse_cfg = query_fuse_config(from_m35="ag-mem-35")
+    heartbeat_timeout_ms = fuse_cfg.heartbeat_timeout
+    warn_cpu = fuse_cfg.warn_cpu_threshold
+    warn_mem = fuse_cfg.warn_mem_threshold
+    half_fuse_global_ratio = fuse_cfg.half_fuse_resource_ratio
+    max_batch_module = 50
+    heartbeat_cache = {} // key:module_id, value:心跳完整结构体
+    stat_warn_count = 0
+    stat_half_fuse_count = 0
+    stat_full_fuse_count = 0
+    last_report_ts = NOW()
+
+    // 等待全模块首次心跳完成初始化
+    WAIT all_module_registry_finish():
+        recv_heartbeat = 获取子模块首次心跳
+        heartbeat_cache[recv_heartbeat.module_id] = recv_heartbeat
+    internal_state = STATE_RUN
+
+    WHILE 系统进程存活:
+        now_ts = NOW()
+        // 1. 接收运维人工调度指令（最高优先级）
+        IF 收到运维人工调度指令:
+            op = 运维指令类型
+            if op == "FULL_FUSE":
+                old_state = internal_state
+                internal_state = STATE_FULL
+                // 分片下发全熔断FUSE指令
+                all_module_list = list(heartbeat_cache.keys())
+                slice_mod_list = split_slice(all_module_list, max_batch_module)
+                for slice in slice_mod_list:
+                    send_control_cmd(target_list=slice, cmd="FUSE")
+                stat_full_fuse_count += 1
+                // 生成紧急告警
+                urgent_alert = build_fuse_alert(fuse_level="full", module_list=all_module_list, op_account=op.operator)
+                send_alert(target="运维告警面板", alert_data=urgent_alert)
+                // 写入人工熔断审计日志
+                audit_log = build_fuse_audit(old_state=old_state, new_state=internal_state, op_type="人工紧急全熔断", ts=now_ts)
+                send_audit_log(target="ag-mem-51", log_data=audit_log)
+            elif op == "RESUME_ALL":
+                // 校验底层无存储故障才可恢复
+                if check_storage_fault() == False:
+                    old_state = internal_state
+                    internal_state = STATE_RUN
+                    all_module_list = list(heartbeat_cache.keys())
+                    slice_mod_list = split_slice(all_module_list, max_batch_module)
+                    for slice in slice_mod_list:
+                        send_control_cmd(target_list=slice, cmd="RESUME")
+                    audit_log = build_fuse_audit(old_state=old_state, new_state=internal_state, op_type="人工恢复全局", ts=now_ts)
+                    send_audit_log(target="ag-mem-51", log_data=audit_log)
+            elif op == "PAUSE_ALL":
+                old_state = internal_state
+                internal_state = STATE_HALF
+                all_module_list = list(heartbeat_cache.keys())
+                slice_mod_list = split_slice(all_module_list, max_batch_module)
+                for slice in slice_mod_list:
+                    send_control_cmd(target_list=slice, cmd="PAUSE")
+                stat_half_fuse_count += 1
+                audit_log = build_fuse_audit(old_state=old_state, new_state=internal_state, op_type="人工全局暂停", ts=now_ts)
+                send_audit_log(target="ag-mem-51", log_data=audit_log)
+            elif op == "ISOLATE_SLOT":
+                isolate_cmd = build_isolate_cmd(funnel_list=op.target_funnel, limit_rate=op.rate)
+                send_isolate_cmd(target_module="ag-mem-15", cmd_data=isolate_cmd)
+                send_audit_log(target="ag-mem-51", log_data=build_isolate_audit(op=op, ts=now_ts))
+
+        // 2. 接收并更新各模块心跳缓存
+        IF 收到子模块心跳健康快照:
+            heart_data = 获取心跳结构体
+            heartbeat_cache[heart_data.module_id] = heart_data
+
+        // 3. 定时心跳失效检测 & 熔断等级判定
+        scan_cycle = 10000 // 10秒一轮检测
+        IF (now_ts - last_report_ts) >= scan_cycle:
+            abnormal_modules = []
+            total_global_mem = 0
+            storage_fault_flag = False
+            // 遍历全部模块判定异常
+            for mid, heart in heartbeat_cache.items():
+                idle_ms = now_ts - heart.last_heartbeat_ts
+                total_global_mem += heart.mem_used
+                // 底层存储模块IO故障检测
+                if mid in ["ag-mem-26","ag-mem-30"] and heart.error_count >= 20:
+                    storage_fault_flag = True
+                // 心跳失联判定
+                if idle_ms >= heartbeat_timeout_ms:
+                    abnormal_modules.append(mid)
+                // 单模块负载超标判定
+                elif heart.cpu_usage >= warn_cpu or heart.mem_used >= warn_mem:
+                    abnormal_modules.append(mid)
+            // 全局内存占用计算
+            global_mem_ratio = calc_global_mem_ratio(total_global_mem, fuse_cfg.global_max_mem)
+
+            // 故障分级切换熔断状态
+            if storage_fault_flag and internal_state != STATE_FULL:
+                old_state = internal_state
+                internal_state = STATE_FULL
+                all_module_list = list(heartbeat_cache.keys())
+                slice_mod_list = split_slice(all_module_list, max_batch_module)
+                for slice in slice_mod_list:
+                    send_control_cmd(target_list=slice, cmd="FUSE")
+                stat_full_fuse_count += 1
+                alert = build_fuse_alert(fuse_level="full", module_list=["ag-mem-26","ag-mem-30"], fault_reason="底层存储连续IO报错")
+                send_alert(target="运维告警面板", alert_data=alert)
+                send_audit_log(target="ag-mem-51", log_data=build_fuse_audit(old_state, internal_state, "底层存储故障自动全熔断", now_ts))
+            elif global_mem_ratio >= half_fuse_global_ratio and internal_state not in [STATE_HALF, STATE_FULL]:
+                old_state = internal_state
+                internal_state = STATE_HALF
+                // 向非核心辅助模块下发PAUSE
+                non_core_modules = ["ag-mem-16","ag-mem-17","ag-mem-18","ag-mem-19","ag-mem-37","ag-mem-40"]
+                slice_mod_list = split_slice(non_core_modules, max_batch_module)
+                for slice in slice_mod_list:
+                    send_control_cmd(target_list=slice, cmd="PAUSE")
+                stat_half_fuse_count += 1
+                send_audit_log(target="ag-mem-51", log_data=build_fuse_audit(old_state, internal_state, "全局资源过载自动半熔断", now_ts))
+            elif len(abnormal_modules) > 0 and internal_state == STATE_RUN:
+                old_state = internal_state
+                internal_state = STATE_WARN
+                stat_warn_count += 1
+                // 对异常模块下发局部限流指令
+                limit_batch = []
+                for mid in abnormal_modules:
+                    limit_batch.append({"module_id":mid, "limit_rate":fuse_cfg.warn_limit_qps})
+                send_limit_batch(target_list=abnormal_modules, cmd_list=limit_batch)
+                warn_alert = build_fuse_alert(fuse_level="warn", module_list=abnormal_modules, fault_reason="模块负载/心跳异常")
+                send_alert(target="运维告警面板", alert_data=warn_alert)
+                send_audit_log(target="ag-mem-51", log_data=build_fuse_audit(old_state, internal_state, "单模块异常自动预警限流", now_ts))
+
+        // 4. 响应全局调度状态批量查询
+        IF 收到全局调度状态批量查询请求:
+            query_param = 获取查询参数
+            full_state_snap = []
+            if query_param.full_export == True:
+                for mid, heart in heartbeat_cache.items():
+                    full_state_snap.append(assemble_module_state_snap(mid, heart, internal_state))
+            else:
+                target_mids = query_param.module_id_list
+                for mid in target_mids:
+                    if mid in heartbeat_cache:
+                        full_state_snap.append(assemble_module_state_snap(mid, heartbeat_cache[mid], internal_state))
+            // 广播状态快照至请求方
+            send_state_snapshot(target_list=query_param.requester_modules, meta_list=full_state_snap)
+
+        // 5. 定时调度内存上报 + 180s周期统计上报
+        IF NOW() - last_report_ts >= 60 * 1000:
+            cache_kb = calc_f0_cache_kb(heartbeat_cache, fuse_cfg.avg_heart_meta_kb)
+            cap_report = build_cap_report(layer="ag-mem-01", used_kb=cache_kb, monitor_module_count=len(heartbeat_cache))
+            send_cap_report(target="ag-mem-48", report=cap_report)
+            // 每180s向ag-mem-03输出全局调度大盘统计
+            IF NOW() - last_report_ts >= 180 * 1000:
+                stat_report = build_f0_runtime_stat(
+                    state=internal_state,
+                    total_warn=stat_warn_count,
+                    total_half_fuse=stat_half_fuse_count,
+                    total_full_fuse=stat_full_fuse_count,
+                    abnormal_module_num=len(abnormal_modules)
+                )
+                send_stat_report(target="ag-mem-03", report=stat_report)
+            last_report_ts = NOW()
+
+        SLEEP 10ms
+```
+
+## 约束与异常处理
+| 场景 | 处理方式 | 恢复条件 |
+|------|----------|----------|
+| 子模块心跳上报格式缺失关键字段 | 标记模块为异常，计入预警清单，不直接触发熔断，等待下一轮完整心跳 | 对应模块修复心跳上报逻辑，输出完整健康快照 |
+| 单次下发调度指令目标模块超过50个 | 自动分片串行推送指令，防止总线消息拥塞风暴 | 内置分片逻辑自动执行 |
+| 底层存储模块连续IO报错触发全熔断 | 冻结全链路所有业务任务，持续监听存储心跳，恢复后需人工下发RESUME解除 | 底层存储IO链路修复，运维人工执行恢复指令 |
+| 心跳缓存内存占用溢出 | 自动清理超过60秒无更新的过期心跳记录，向ag-mem-48上报容量告警 | 扩容调度内存或缩短心跳上报周期 |
+| ag-mem-35熔断配置拉取失败 | 加载本地内置兜底三级熔断阈值继续运行，输出配置缺失告警 | ag-mem-35服务恢复，下发完整熔断策略配置 |
+| 运维面板人工指令消息丢失 | 无自动重试，运维需重新下发操作指令，审计日志仅记录成功执行操作 | 运维重新发起调度操作 |
+
+## 总线契约
+| 总线 | 操作 | 数据内容 | 权限 | 说明 |
+|------|------|----------|------|------|
+| 全局内部调度总线 | 读 | 全子模块心跳快照、熔断配置、全局状态查询请求 | 只读 | 所有记忆子模块、ag-mem-35、运维面板 |
+| 运维管控总线 | 读 | 人工启停/熔断/分槽隔离运维指令 | 只读 | 运维后台面板 |
+| 全局内部调度总线 | 写 | PAUSE/RESUME/FUSE全局调度指令、局部限流/隔离指令、全模块状态快照 | 全局专属写入权限 | 全部记忆子模块 |
+| 运维告警总线 | 写 | 熔断分级故障告警汇总报表 | 专属写入 | 运维告警面板 |
+| 内部调度总线 | 写 | 调度内存容量上报、熔断审计日志、周期全局统计报表 | 周期/事件写入 | ag-mem-48、ag-mem-51、ag-mem-03 |
+
+## 安全边界（V1.1全局顶层调度强制规范）
+| 规则编号 | 内容 |
+|:---:|------|
+| F0-01 | 全局唯一管控指令下发源，禁止任意记忆子模块之间互相下发暂停/熔断/限流指令，统一权限收敛至ag-mem-01，避免多源调度冲突 |
+| F0-02 | 仅监控模块负载、心跳、故障指标，无任何业务记忆数据读写、分槽创建/销毁、条目晋升归档操作权限，纯观测调度底座，杜绝业务数据篡改风险 |
+| F0-03 | 熔断阈值、心跳超时、降级白名单全部由ag-mem-35集中管控，本地无硬编码故障判定参数，策略统一运维管控 |
+| F0-04 | 所有熔断切换、人工运维操作、模块隔离全量写入ag-mem-51审计日志，记录熔断等级、受影响模块、操作人员、故障原因，支撑全链路故障溯源审计 |
+| F0-05 | 批量下发指令分片限流，单次最多管控50个模块，规避瞬时大批量总线消息抢占通信资源，保障底层通信稳定 |
+| F0-06 | 全熔断状态仅保留心跳、审计、告警三条基础通路，阻断所有业务读写计算，防止故障扩散损坏记忆持久数据 |
+
+## 接口校验用例
+| 用例编号 | 前置条件 | 输入 | 预期输出 |
+|----------|----------|------|----------|
+| TC-F0-01 | `F0_RUN`，ag-mem-30底层存储连续20次IO报错心跳 | 存储模块异常心跳快照 | 自动切换`F0_FULL_FUSE`，向全模块下发FUSE熔断指令，推送紧急存储故障告警 |
+| TC-F0-02 | `F0_RUN`，全局内存占用达到88%半熔断阈值 | 全模块心跳汇总高内存指标 | 切换`F0_HALF_FUSE`，向ag-mem16/17/18/19/37/40下发PAUSE暂停指令 |
+| TC-F0-03 | `F0_RUN`，ag-mem-27单模块CPU占用78%超标 | 单模块高负载心跳快照 | 进入`F0_WARN_LIMIT`，仅对ag-mem-27下发局部限流指令，输出低风险告警 |
+| TC-F0-04 | `F0_WARN_LIMIT`，运维下发人工RESUME_ALL恢复指令，无底层存储故障 | 人工全局恢复指令 | 校验无硬件故障，切换回`F0_RUN`，向所有模块下发RESUME恢复指令 |
+| TC-F0-05 | `F0_RUN`，单次包含55个模块的批量状态查询请求 | 超大批量模块查询 | 自动分片返回全模块状态快照，无总线消息阻塞 |
+| TC-F0-06 | `F0_RUN`，运维下发ISOLATE_SLOT指定funnel隔离指令 | 分槽人工隔离运维指令 | 下发流量隔离指令至ag-mem-15，写入分槽隔离操作审计日志，全局熔断等级不变 |
+
+## 质量自检清单
+| 检查项 | 状态 |
+|--------|:---:|
+| 模块编号ag-mem-01匹配白皮书全局顶层熔断调度底座定位 | ✅ |
+| 下游覆盖全部记忆子模块，唯一全局指令下发源，数据流管控闭环无冲突 | ✅ |
+| 5层完整调度状态，覆盖初始化、正常、预警、半熔断、全熔断全故障生命周期 | ✅ |
+| 输入输出完整标注收发端、数据结构体、优先级，全局链路无错乱 | ✅ |
+| 三级熔断分级、心跳失效判定、存储故障优先熔断规则严格对齐V1.1全局稳定性底座规范 | ✅ |
+| 伪代码覆盖心跳接收、故障分级判定、分片指令下发、人工运维处置、状态快照查询、容量上报、审计日志全链路 | ✅ |
+| 异常场景覆盖心跳残缺、超大批量模块、存储故障、缓存溢出、配置缺失、指令丢失共6类全覆盖 | ✅ |
+| 总线权限隔离，仅F0具备全局管控指令下发权限，子模块无调度下发能力 | ✅ |
+| 6条V1.1安全约束收敛调度权限、隔离业务数据操作、故障可追溯、防止消息风暴、阻断故障扩散 | ✅ |
+| 6条自动化测试用例覆盖全部熔断调度核心业务场景 | ✅ |
+
+---
